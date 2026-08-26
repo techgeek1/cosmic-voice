@@ -1,0 +1,81 @@
+[package]
+name    = "cosmic-voice"
+version = "0.1.0"
+edition = "2024"
+description = "Local push-to-talk dictation applet for the COSMIC desktop"
+license = "MIT"
+
+[dependencies]
+# Errors / logging.
+anyhow             = "1"
+thiserror          = "2"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async runtime. The engine is a single-threaded event loop; whisper inference
+# runs on a blocking thread so it never stalls the applet's UI.
+tokio   = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "time", "io-util"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# Serialisation for the IPC frame format and the on-disk config.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+ron        = "0.8"
+
+# Direct evdev access. We drive the fd ourselves rather than using the `evdev`
+# crate because EVIOCSMASK is the security-relevant part of this program and it
+# belongs visibly at the open site, not behind a wrapper.
+libc = "0.2"
+udev   = "0.9"
+
+# Audio capture as a native PipeWire client, not via cpal.
+#
+# cpal would reach PipeWire through its pulse/ALSA compatibility layer, which
+# lands the capture callback on an ordinary thread in this process. Under heavy
+# load that thread is exactly what the scheduler starves, and starving it means
+# gaps in the pre-roll ring. A native client's process callback runs on
+# PipeWire's own data-loop, which is already SCHED_FIFO at priority 88 and keeps
+# being serviced when everything else on the box stops. Costs maybe 100 lines of
+# format negotiation over cpal's 10. Worth it here.
+pipewire = { version = "0.10", features = ["v0_3_44"] }
+libspa   = "0.10"
+
+# Speech recognition and voice activity detection, both from sherpa-onnx.
+# CPU on purpose: ONNX Runtime has no Vulkan EP and its ROCm EP needs ORT built
+# from source, while a 0.6B int8 transducer runs many times faster than real
+# time on 16 Zen 3 cores. The GPU stays free.
+#
+# NOTE: this crate links statically and, absent SHERPA_ONNX_LIB_DIR, downloads
+# a matching prebuilt archive at build time. Vendor or pin that before CI.
+sherpa-onnx = "1.13"
+
+# Thread priority for the inference worker. Never run inference on an RT thread:
+# a 0.25s compute burst at realtime priority glitches every other audio client
+# on the system.
+rustix = { version = "1", features = ["process", "fs", "event", "thread"] }
+
+# Wayland text injection. virtual-keyboard is the universal path,
+# input-method-v2 the fast path when the focused client speaks text-input-v3.
+wayland-client          = "0.31"
+wayland-protocols       = { version = "0.32", features = ["client", "unstable", "staging"] }
+wayland-protocols-misc  = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr   = { version = "0.3", features = ["client"] }
+xkbcommon               = "0.8"
+
+# Focused-window app_id, used to pick a per-application vocabulary prompt.
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
+
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+    "applet",
+    "tokio",
+    "wayland",
+] }
+cosmic-config = { git = "https://github.com/pop-os/libcosmic" }
+
+[patch."https://github.com/smithay/client-toolkit.git"]
+sctk = { package = "smithay-client-toolkit", version = "0.20.0" }
+
+[profile.release]
+opt-level = 3
+panic     = "abort"
+lto       = "thin"

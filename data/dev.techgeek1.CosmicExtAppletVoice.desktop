@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Exec=/usr/bin/cosmic-voice
+Name=Voice
+Comment=Local push-to-talk dictation
+Icon=dev.techgeek1.CosmicExtAppletVoice
+NoDisplay=true
+Categories=COSMIC;
+X-CosmicApplet=true
+X-CosmicAppletId=dev.techgeek1.CosmicExtAppletVoice
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=5
