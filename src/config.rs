@@ -57,13 +57,42 @@ pub struct Config {
     /// punctuation, and at 6.0 decoding degenerates into the hotword's tokens
     /// repeating until the utterance ends. Treat 1.5 as a hard ceiling.
     pub hotword_score       : f32,
-    /// Threads given to each recogniser.
+    /// Threads given to the streaming recogniser.
     ///
-    /// Two is the knee: measured on this machine the offline model decodes
-    /// 7.4s of audio in 0.55s at two threads (1.09 core-seconds), and more
-    /// threads buy latency at a worse core-seconds cost. Keep it low; the
-    /// machine is busy.
+    /// Two is the knee: it decodes far faster than real time at that width and
+    /// more threads buy latency nobody is waiting on, since partials are
+    /// already ahead of the speaker. Keep it low; the machine is busy.
     pub asr_threads         : u32,
+    /// Threads given to the offline recogniser.
+    ///
+    /// Separate from `asr_threads` because the two passes are waited on
+    /// differently. Nobody waits on a partial, but the offline pass over the
+    /// last segment is the whole delay between releasing the key and seeing
+    /// text, so it is worth spending cores on. Measured here on 60s of audio:
+    /// 5.8s at two threads, 3.9s at four, no further gain at eight, and worse
+    /// again at sixteen as the per-layer split stops covering its own
+    /// synchronisation.
+    pub offline_threads     : u32,
+    /// Trailing silence that ends a segment inside a long utterance.
+    ///
+    /// The offline pass costs *more* than linearly in audio length — the
+    /// encoder's attention is global, so at four threads 30s decodes at
+    /// 0.052x real time and 120s at 0.093x — which is why a long dictation
+    /// lands seconds after the key comes up. Cutting at pauses lets each
+    /// completed segment decode while the user is still talking, leaving only
+    /// the tail to decode on release, and keeps every pass in the cheap part
+    /// of that curve. Cuts land inside silence, so no word is split; the
+    /// committed text is the segments joined.
+    ///
+    /// Zero disables segmentation and restores the single-pass behaviour.
+    pub segment_pause_ms    : u32,
+    /// Speech a segment must carry before a pause may end it.
+    ///
+    /// Guards against carving a hesitant speaker into fragments: each segment
+    /// costs one model pass with its fixed overhead, so short ones lose more
+    /// than they save. Utterances shorter than this take the single-pass path
+    /// unchanged.
+    pub min_segment_ms      : u32,
     /// What to do for live text when preedit is unavailable.
     pub fallback_partials   : FallbackPartials,
     /// Consecutive partials a prefix must survive before it can be typed on
@@ -104,6 +133,9 @@ impl Default for Config {
             hotwords_by_app_id  : HashMap::new(),
             hotword_score       : 1.0,
             asr_threads         : 2,
+            offline_threads     : 4,
+            segment_pause_ms    : 500,
+            min_segment_ms      : 3_000,
             fallback_partials   : FallbackPartials::WaitForFinal,
             stability_frames    : 2,
             asr_nice            : -5,

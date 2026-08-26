@@ -15,17 +15,17 @@ use std::collections::VecDeque;
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::asr::{AsrCmd, AsrEvent};
+use crate::asr::{AsrEvent, OfflineCmd, StreamCmd};
 use crate::audio::Capture;
 use crate::config::{Config, FallbackPartials};
 use crate::hotkey::{HotkeyEvent, KeyEdge, Watcher};
 use crate::inject::{Injector, common_prefix_len};
 use crate::ipc::{Command, Event};
 use crate::transcript_log;
-use crate::vad::SilenceGate;
+use crate::vad::{SegmentGate, SilenceGate};
 
 /// How often captured audio is drained to the recogniser while recording.
-const TICK_MS: u64 = 60;
+pub const TICK_MS: u64 = 60;
 
 /// Where the engine is in the capture cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,7 @@ enum State {
     /// Capturing. `held` records whether this utterance ends on key release
     /// (hold-to-talk) or on silence/toggle (press-once).
     Recording { held: bool },
-    /// Offline model running on the final buffer. Further triggers are
+    /// Offline model running on the last segment. Further triggers are
     /// ignored rather than queued.
     Transcribing,
 }
@@ -185,23 +185,40 @@ struct Engine {
     hotkey     : Option<crate::hotkey::Control>,
     /// Continuously running microphone capture.
     capture    : Capture,
-    /// Commands into the recogniser thread.
-    asr        : std::sync::mpsc::Sender<AsrCmd>,
-    /// Results out of the recogniser thread.
+    /// Commands into the streaming recogniser thread.
+    asr        : std::sync::mpsc::Sender<StreamCmd>,
+    /// Commands into the offline recogniser thread.
+    offline    : std::sync::mpsc::Sender<OfflineCmd>,
+    /// Results out of both recogniser threads.
     asr_events : mpsc::UnboundedReceiver<AsrEvent>,
     /// Wayland text injection.
     inject     : Injector,
     /// Trailing-silence detector for press-once mode.
     vad        : SilenceGate,
+    /// Pause detector that cuts a long utterance into decodable segments.
+    seg_gate   : SegmentGate,
     /// State transitions published to the applet.
     events     : broadcast::Sender<Event>,
     /// Most recent state event, replayed to mirrors when they subscribe.
     latest     : crate::ipc::Latest,
 
-    /// Ring position where the current utterance starts (pre-roll included).
-    utt_start  : u64,
+    /// Ring position where the current segment starts. The first segment of
+    /// an utterance starts at `now - preroll`; each later one starts where its
+    /// predecessor was cut.
+    seg_start  : u64,
     /// Ring position up to which audio has been fed to the streaming model.
     cursor     : u64,
+    /// Identifies the utterance segments belong to. Bumped when an utterance
+    /// is abandoned, which is how results for it are recognised and dropped.
+    utt_seq    : u64,
+    /// Finished segment transcripts, in order. Joined at commit.
+    seg_texts  : Vec<String>,
+    /// Segments handed to the offline model that have not answered yet.
+    seg_wait   : u32,
+    /// Whether the utterance's last segment has been dispatched.
+    seg_last   : bool,
+    /// First segment error of this utterance, reported instead of a commit.
+    seg_error  : Option<String>,
     /// Wall-clock start of the current utterance.
     started    : Instant,
     /// Seconds value last published in a `Recording` event, to throttle them.
@@ -212,7 +229,7 @@ struct Engine {
     vk_typed   : String,
     /// The streaming model's latest hypothesis this utterance, for the log.
     last_hyp   : String,
-    /// Samples handed to the offline model, for the log.
+    /// Samples handed to the offline model across every segment, for the log.
     utt_len    : usize,
 }
 
@@ -225,7 +242,7 @@ impl Engine {
         let inject = Injector::connect(config.bind_input_method)
             .context("connecting the injector")?;
         tracing::info!("injector ready, input method: {}", inject.im_status());
-        let (asr, asr_events) = crate::asr::spawn(&config);
+        let asr = crate::asr::spawn(&config);
 
         let snapshot = crate::ipc::Snapshot {
             state   : None,
@@ -235,13 +252,19 @@ impl Engine {
 
         Ok(Self {
             vad        : SilenceGate::new(config.silence_ms),
+            seg_gate   : SegmentGate::new(config.segment_pause_ms, config.min_segment_ms),
             state      : State::Idle,
             enabled    : true,
             logging    : config.log_transcripts,
             rebinding  : false,
             hotkey     : None,
-            utt_start  : 0,
+            seg_start  : 0,
             cursor     : 0,
+            utt_seq    : 0,
+            seg_texts  : Vec::new(),
+            seg_wait   : 0,
+            seg_last   : false,
+            seg_error  : None,
             started    : Instant::now(),
             last_sec   : 0,
             hyps       : VecDeque::new(),
@@ -250,8 +273,9 @@ impl Engine {
             utt_len    : 0,
             config     : config,
             capture    : capture,
-            asr        : asr,
-            asr_events : asr_events,
+            asr        : asr.stream,
+            offline    : asr.offline,
+            asr_events : asr.events,
             inject     : inject,
             events     : events,
             latest     : std::sync::Arc::new(std::sync::Mutex::new(snapshot)),
@@ -367,9 +391,10 @@ impl Engine {
             self.emit(Event::Idle);
             return;
         }
-        // Late `Final`s are dropped because the state is no longer
-        // `Transcribing`; see `on_asr`.
+        // Segments still in the offline model are dropped on arrival because
+        // the sequence has moved on; see `on_segment`.
         let _ = self.inject.preedit("");
+        self.abandon_utterance();
         self.state = State::Idle;
         self.emit(Event::Disabled);
     }
@@ -421,18 +446,34 @@ impl Engine {
 
     /// Begins capture at `now - preroll`.
     fn start_recording(&mut self, held: bool) {
-        self.utt_start = self.capture.mark_preroll();
-        self.cursor = self.utt_start;
+        self.abandon_utterance();
+        self.seg_start = self.capture.mark_preroll();
+        self.cursor = self.seg_start;
         self.started = Instant::now();
         self.last_sec = 0;
+        self.utt_len = 0;
         self.vad.reset();
+        self.seg_gate.reset();
         self.hyps.clear();
         self.vk_typed.clear();
         self.last_hyp.clear();
-        let _ = self.asr.send(AsrCmd::Reset);
+        let _ = self.asr.send(StreamCmd::Reset);
 
         self.state = State::Recording { held: held };
         self.emit(Event::Recording { elapsed_ms: 0 });
+    }
+
+    /// Drops whatever the previous utterance accumulated.
+    ///
+    /// Bumping the sequence is what makes in-flight segment decodes harmless:
+    /// their results arrive stamped with the old number and are discarded on
+    /// arrival, so nothing has to be cancelled inside the recogniser.
+    fn abandon_utterance(&mut self) {
+        self.utt_seq += 1;
+        self.seg_texts.clear();
+        self.seg_wait = 0;
+        self.seg_last = false;
+        self.seg_error = None;
     }
 
     /// Drains new audio to the streaming model and enforces the end rules.
@@ -444,13 +485,23 @@ impl Engine {
             let chunk = self.capture.read(self.cursor, now);
             self.cursor = now;
 
+            // Both gates see every window: the segment gate has to keep
+            // counting speech even on the windows the end gate ignores.
+            let boundary = self.seg_gate.push(&chunk);
+
             // Silence only ends the utterance when no key is holding it open;
             // in hold mode the human's finger is the endpointer.
             if self.vad.push(&chunk) && !held {
                 self.finish_recording();
                 return;
             }
-            let _ = self.asr.send(AsrCmd::Feed(chunk));
+            let _ = self.asr.send(StreamCmd::Feed(chunk));
+
+            // The cut lands inside the pause the gate just measured, so no
+            // word is split and the tail left for release stays short.
+            if boundary {
+                self.cut_segment(self.cursor, false);
+            }
         }
 
         let elapsed = self.started.elapsed();
@@ -465,15 +516,34 @@ impl Engine {
         }
     }
 
-    /// Ends capture and hands the whole utterance to the offline model.
+    /// Ends capture and hands the last segment to the offline model.
+    ///
+    /// Everything before the last pause is already decoded or decoding, so
+    /// what the user waits on here is the tail, not the recording.
     fn finish_recording(&mut self) {
-        let samples = self.capture.read(self.utt_start, self.capture.now());
-        let hotwords = self.config.default_hotwords.clone();
-        self.utt_len = samples.len();
-        let _ = self.asr.send(AsrCmd::Finalize { samples: samples, hotwords: hotwords });
+        self.cut_segment(self.capture.now(), true);
 
         self.state = State::Transcribing;
         self.emit(Event::Transcribing);
+    }
+
+    /// Sends `seg_start..end` to the offline model as one segment.
+    ///
+    /// Hotwords go with every segment: biasing has to apply wherever the word
+    /// happens to fall, and the context graph is rebuilt per stream anyway.
+    fn cut_segment(&mut self, end: u64, last: bool) {
+        let samples = self.capture.read(self.seg_start, end);
+        let hotwords = self.config.default_hotwords.clone();
+        self.seg_start = end;
+        self.utt_len += samples.len();
+        self.seg_wait += 1;
+        self.seg_last = last;
+
+        let _ = self.offline.send(OfflineCmd::Transcribe {
+            seq      : self.utt_seq,
+            samples  : samples,
+            hotwords : hotwords,
+        });
     }
 
     /// Discards the in-flight utterance.
@@ -482,6 +552,7 @@ impl Engine {
         // clears it anyway when focus moves.
         let _ = self.inject.preedit("");
 
+        self.abandon_utterance();
         self.state = State::Idle;
         self.emit(Event::Idle);
     }
@@ -506,21 +577,50 @@ impl Engine {
                     self.last_hyp = text;
                 }
             }
-            AsrEvent::Final(Ok(text)) => {
-                if self.state == State::Transcribing {
-                    self.commit(&text);
+            AsrEvent::Final { seq, text } => self.on_segment(seq, text),
+        }
+    }
+
+    /// Files one segment's transcript, committing once the utterance is whole.
+    ///
+    /// Segments come back in dispatch order because the offline worker is a
+    /// single thread, so appending is enough to reassemble the utterance.
+    fn on_segment(&mut self, seq: u64, text: Result<String, String>) {
+        // A cancelled, disarmed or superseded utterance: nobody is waiting.
+        if seq != self.utt_seq {
+            return;
+        }
+        self.seg_wait = self.seg_wait.saturating_sub(1);
+
+        match text {
+            Ok(text) => {
+                if !text.is_empty() {
+                    self.seg_texts.push(text);
                 }
             }
-            AsrEvent::Final(Err(reason)) => {
-                // Only report a failure someone is waiting on; a cancelled or
-                // disarmed utterance's error is just noise.
-                if self.state == State::Transcribing {
-                    self.state = State::Idle;
-                    self.emit(Event::Failed { reason: reason });
-                    self.emit(Event::Idle);
-                }
+            // Reported once, after the rest of the utterance settles: failing
+            // a recording the user is still speaking into helps nobody.
+            Err(reason) => {
+                self.seg_error.get_or_insert(reason);
             }
         }
+        if !self.seg_last || self.seg_wait > 0 {
+            return;
+        }
+
+        if let Some(reason) = self.seg_error.take() {
+            self.abandon_utterance();
+            self.state = State::Idle;
+            self.emit(Event::Failed { reason: reason });
+            self.emit(Event::Idle);
+            return;
+        }
+
+        // Segments are cut at pauses, so a space is the right joint: the model
+        // has already punctuated each one as a sentence would end.
+        let text = self.seg_texts.join(" ");
+        self.abandon_utterance();
+        self.commit(&text);
     }
 
     /// Routes provisional text to whichever display the focus allows.

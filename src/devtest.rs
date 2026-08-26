@@ -10,24 +10,32 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::asr::{Recognizer, SAMPLE_RATE, StreamingRecognizer};
+use crate::engine::TICK_MS;
+use crate::vad::SegmentGate;
 
 /// Dispatches one check by name.
 pub fn run(args: &[String]) -> Result<()> {
     match args {
-        [c, model, wav] if c == "decode" => decode(Path::new(model), wav),
-        [c, model, wav] if c == "stream" => stream(Path::new(model), wav),
+        [c, model, wav] if c == "decode" => decode(Path::new(model), wav, 2),
+        [c, model, wav, n] if c == "decode" => decode(Path::new(model), wav, n.parse()?),
+        [c, model, wav] if c == "stream" => stream(Path::new(model), wav, 2),
+        [c, model, wav, n] if c == "stream" => stream(Path::new(model), wav, n.parse()?),
+        [c, model, wav] if c == "finalize" => finalize(Path::new(model), wav, 4),
+        [c, model, wav, n] if c == "finalize" => finalize(Path::new(model), wav, n.parse()?),
         [c, secs] if c == "capture"      => capture(secs.parse()?),
         [c] if c == "keys"               => keys(),
         [c] if c == "rebind"             => rebind(),
         [c] if c == "engine"             => engine(),
         [c] if c == "inject-probe"       => inject_probe(false),
+        [c, secs, text] if c == "type"   => type_text(secs.parse()?, text),
         // DANGER: binds the seat's input-method slot. With IBus's Wayland IM
         // running this has wedged all keyboard input; recovery is
         // `ibus exit; pkill -f ibus-ui-gtk3`. Run only deliberately.
         [c] if c == "inject-probe-im"    => inject_probe(true),
         _ => Err(anyhow!(
-            "checks: decode <model_dir> <wav> | stream <model_dir> <wav> | \
-             capture <secs> | keys | rebind | inject-probe"
+            "checks: decode <model_dir> <wav> [threads] | stream <model_dir> <wav> [threads] | \
+             finalize <model_dir> <wav> [threads] | capture <secs> | keys | rebind | \
+             inject-probe | type <secs> <text>"
         )),
     }
 }
@@ -44,12 +52,12 @@ fn load_wav(path: &str) -> Result<Vec<f32>> {
 }
 
 /// One offline pass over a WAV, timed.
-fn decode(model: &Path, wav: &str) -> Result<()> {
+fn decode(model: &Path, wav: &str, threads: u32) -> Result<()> {
     let samples = load_wav(wav)?;
     let dur = samples.len() as f32 / SAMPLE_RATE as f32;
 
     let t0 = Instant::now();
-    let rec = Recognizer::load(model, 2, 1.0)?;
+    let rec = Recognizer::load(model, threads, 1.0)?;
     println!("load    {:.2?}", t0.elapsed());
 
     let t0 = Instant::now();
@@ -62,11 +70,11 @@ fn decode(model: &Path, wav: &str) -> Result<()> {
 }
 
 /// Streams a WAV through the online model in 560ms chunks, printing partials.
-fn stream(model: &Path, wav: &str) -> Result<()> {
+fn stream(model: &Path, wav: &str, threads: u32) -> Result<()> {
     let samples = load_wav(wav)?;
 
     let t0 = Instant::now();
-    let mut rec = StreamingRecognizer::load(model, 2)?;
+    let mut rec = StreamingRecognizer::load(model, threads)?;
     println!("load    {:.2?}", t0.elapsed());
 
     let chunk = (SAMPLE_RATE as f32 * 0.56) as usize;
@@ -81,6 +89,81 @@ fn stream(model: &Path, wav: &str) -> Result<()> {
     }
     let dur = samples.len() as f32 / SAMPLE_RATE as f32;
     println!("total   {spent:.2?} for {dur:.2}s audio, RTF {:.4}", spent.as_secs_f32() / dur);
+
+    Ok(())
+}
+
+/// Replays a WAV through the engine's segmentation and offline decode, timed.
+///
+/// Answers the question the applet cannot be asked headlessly: how long the
+/// user waits after letting go of the key. The audio is walked in the same
+/// windows `engine::on_tick` uses, cut by the same [`SegmentGate`], and each
+/// completed segment decoded as the engine would decode it mid-utterance. The
+/// number that matters is the last line: everything before the final pause is
+/// already done when the key comes up, so only the tail is latency.
+///
+/// `slack` is how much audio time separated a segment's cut from the next one
+/// minus what its decode cost. Negative anywhere means the offline model is
+/// falling behind the speaker and the backlog will surface as extra latency at
+/// release.
+fn finalize(model: &Path, wav: &str, threads: u32) -> Result<()> {
+    let samples = load_wav(wav)?;
+    let dur = samples.len() as f32 / SAMPLE_RATE as f32;
+    let config = crate::config::Config::load();
+
+    let rec = Recognizer::load(model, threads, config.hotword_score)?;
+    let mut gate = SegmentGate::new(config.segment_pause_ms, config.min_segment_ms);
+    let window = (SAMPLE_RATE as u64 * TICK_MS / 1000) as usize;
+
+    println!(
+        "pause {}ms  min segment {}ms  threads {threads}",
+        config.segment_pause_ms, config.min_segment_ms,
+    );
+
+    let mut texts = Vec::new();
+    let mut spent = std::time::Duration::ZERO;
+    let mut start = 0usize;
+    let mut prev_cut = 0f32;
+    let mut fed = 0usize;
+
+    for chunk in samples.chunks(window) {
+        fed += chunk.len();
+        if !gate.push(chunk) {
+            continue;
+        }
+
+        let t0 = Instant::now();
+        let text = rec.transcribe(&samples[start..fed], &config.default_hotwords)?;
+        let dt = t0.elapsed();
+        spent += dt;
+
+        let at = fed as f32 / SAMPLE_RATE as f32;
+        println!(
+            "segment  cut at {at:6.2}s  {:6.2}s audio  decode {dt:>8.2?}  slack {:+.2}s",
+            at - prev_cut,
+            (at - prev_cut) - dt.as_secs_f32(),
+        );
+        if !text.is_empty() {
+            texts.push(text);
+        }
+        start = fed;
+        prev_cut = at;
+    }
+
+    let t0 = Instant::now();
+    let text = rec.transcribe(&samples[start..], &config.default_hotwords)?;
+    let tail = t0.elapsed();
+    spent += tail;
+    if !text.is_empty() {
+        texts.push(text);
+    }
+
+    println!(
+        "tail     {:6.2}s audio  decode {tail:>8.2?}   <- latency after release",
+        dur - prev_cut,
+    );
+    println!("total    {spent:.2?} of decode over {dur:.2}s audio in {} segments", texts.len());
+    println!("text     {:?}", texts.join(" "));
 
     Ok(())
 }
@@ -193,6 +276,19 @@ fn inject_probe(bind_im: bool) -> Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(300));
     injector.pump()?;
     println!("input method     : {} (after settle)", injector.im_status());
+
+    Ok(())
+}
+
+/// Types `text` through the virtual keyboard after `secs` seconds, which is
+/// long enough to focus the window under test. Reproduces injection faults
+/// without the ASR in the loop.
+fn type_text(secs: u64, text: &str) -> Result<()> {
+    let mut injector = crate::inject::Injector::connect(false)?;
+    println!("typing {text:?} in {secs}s — focus the target window");
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    injector.type_text(text)?;
+    println!("done");
 
     Ok(())
 }

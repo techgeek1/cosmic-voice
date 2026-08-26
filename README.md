@@ -19,10 +19,21 @@ machine.
 - **Recognition** uses two resident int8 transducers on the CPU, because
   provisional and final text want opposite things.
   `nemotron-3.5-asr-streaming-0.6b` decodes incrementally at 560ms chunks to
-  drive live preedit; one offline pass of `parakeet-unified-en-0.6b` with
-  hotword biasing produces the text that actually gets committed. Transducers
-  also emit nothing during silence, which matters because push-to-talk brackets
-  every utterance with silence and whisper hallucinates there.
+  drive live preedit; offline passes of `parakeet-unified-en-0.6b` with hotword
+  biasing produce the text that actually gets committed. Transducers also emit
+  nothing during silence, which matters because push-to-talk brackets every
+  utterance with silence and whisper hallucinates there.
+- **Long utterances are decoded as you speak them.** The offline pass costs
+  more than linearly in audio length — measured here at four threads, 30s
+  decodes at 0.052× real time but 120s at 0.093× — so waiting for the key to
+  come up before starting it makes a minute of dictation land seconds late.
+  Instead the engine cuts the recording at pauses of `segment_pause_ms` and
+  decodes each finished segment while the next one is still being spoken, so
+  releasing the key only ever decodes the tail. Measured on 60s of dictation:
+  3.9s of waiting before, 0.35s after. Cuts land inside silence, so no word is
+  split, and utterances too short to reach `min_segment_ms` of speech take the
+  single-pass path exactly as before. The two recognisers run on threads of
+  their own, so a segment decode never stalls the partials.
 - **Injection** is a synthesised keymap over `zwp_virtual_keyboard_v1`: it
   reaches every client, types arbitrary Unicode, and never contends with a real
   IME. By default nothing is typed until the offline result lands; set
@@ -46,8 +57,16 @@ settings. No XKB changes are needed: evdev sits below the keymap, so it does
 not matter that the default `us` layout maps keycode 183 to `XF86Tools`.
 
 Settings live in `~/.config/cosmic-voice/config.ron`, written with commented
-defaults on first run. `cosmic-voice enable|disable|start|stop|toggle|cancel`
-controls a running instance from scripts or extra keybindings.
+defaults on first run. `asr_threads` (2) sizes the streaming recogniser and
+`offline_threads` (4) the offline one, which is separate because nobody waits
+on a partial but everybody waits on the commit; past four threads the offline
+model stops getting faster. `segment_pause_ms` (500) is the trailing silence
+that ends a segment inside a long utterance and `min_segment_ms` (3000) the
+speech a segment must carry before a pause may end it — set `segment_pause_ms`
+to 0 to disable segmentation and decode every utterance in one pass.
+
+`cosmic-voice enable|disable|start|stop|toggle|cancel` controls a running
+instance from scripts or extra keybindings.
 
 The popup has two switches and a key. **Dictation** arms or disarms the
 trigger. **Log transcripts** appends every committed utterance as a JSON line
@@ -70,7 +89,7 @@ rest mirror it, so every panel icon works and nothing runs multiplied.
 | -------------- | ------------------------------------------------- |
 | `hotkey.rs`    | evdev watcher, `EVIOCSMASK` filter, udev hotplug  |
 | `audio.rs`     | continuous capture, pre-roll ring buffer          |
-| `vad.rs`       | trailing-silence detection and release backstop   |
+| `vad.rs`       | trailing-silence detection, segment cut points    |
 | `asr.rs`       | streaming + offline recognisers, hotword biasing  |
 | `inject.rs`    | input-method-v2 and virtual-keyboard paths        |
 | `toplevel.rs`  | focused app_id for prompt selection               |
