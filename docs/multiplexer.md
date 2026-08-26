@@ -112,7 +112,8 @@ useful IBusText reference).
   ibus-daemon itself — SASL EXTERNAL, standard `Hello`, daemon is `:1.0`.
   Signals to us are unicast. Watch `org.freedesktop.IBus` on the session bus
   for daemon restarts; reconnect and rebuild contexts.
-- **Context lifecycle**: `CreateInputContext("cosmic-voice")` →
+- **Context lifecycle**: `CreateInputContext("wayland-cosmic-voice")` —
+  the name is load-bearing, see finding 1 below →
   `Properties.Set ClientCommitPreedit=(true)` →
   `EffectivePostProcessKeyEvent=(true)` → `SetCapabilities(PREEDIT_TEXT |
   FOCUS | SURROUNDING_TEXT | LOOKUP_TABLE | AUXILIARY_TEXT)` → `FocusIn` on
@@ -209,7 +210,8 @@ Register the configured triggers via
 `org.freedesktop.ibus.general.hotkey triggers` dconf). The daemon then
 consumes the trigger inside ProcessKeyEvent (returns handled) and emits
 `GlobalShortcutKeyResponded`; we respond by cycling: `SetGlobalEngine(next)`
-over the daemon's `ActiveEngines` list. No switcher popup in v1 — press
+over the dconf `preload-engines` list (`ActiveEngines` is empty in practice,
+finding 2 below). No switcher popup in v1 — press
 cycles, the panel applet can display the current engine name. (The daemon's
 own release-signal latency workaround suggests keeping any future
 press/release switcher state client-side.)
@@ -268,9 +270,11 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
 
 1. **Event loop for the im thread**: calloop (idiomatic for wayland-client,
    used by every smithay-side client) vs polling inside the engine's tokio
-   select. Recommendation: calloop on a dedicated thread; zbus can run on its
-   own tokio-lite executor with an fd bridge, or we use zbus's blocking API
-   since sync mode blocks anyway.
+   select. Recommendation: calloop on a dedicated thread. Phase 1 showed
+   that zbus's blocking API does *not* hand over a pollable fd for free
+   (finding 3 below): the choice for phase 2 is between ticking zbus's own
+   executor from a calloop source and building zbus with `async-io` so its
+   reactor fd can be registered directly.
 2. **Candidate paint stack**: tiny-skia + cosmic-text (recommended: small,
    no toolkit, we control the surface) vs embedding iced (heavy; iced cannot
    target an IM popup surface without surgery).
@@ -281,8 +285,9 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
 
 ## Build strategy (banked 2026-08-25)
 
-Status: **designed, not started.** Shipping the English-only VK applet first;
-this section records how we intend to execute when picked back up.
+Status: **phase 1 done (2026-08-26)**, `src/ibus/` — see the findings
+section below for what implementing it corrected in this document. Phases
+2–5 not started.
 
 Implementation will be agent-driven, which changes the bottleneck: the
 mechanical bulk (proxies, codec, relay tables) is hours of wall clock, and the
@@ -309,3 +314,60 @@ consequences:
 
 Prerequisite chores when resuming: file the smithay `add_instance` bug
 upstream; decide the engine-switcher scope (default: cycle-only, no popup).
+
+## Findings from phase 1 (2026-08-26)
+
+Implementing the ibus client against ibus 1.5.34 source and the live daemon
+turned up these corrections. Citations are into the 1.5.34 tree.
+
+1. **The client name must start with `wayland`.** `bus/inputcontext.c:389-398`
+   (`IGNORE_FOCUS_OUT_CONDITION`) compares the first seven characters of the
+   name passed to `CreateInputContext` against `"wayland"`; for any other
+   client, in what the daemon considers a Wayland session, it latches
+   `ignore_focus_out` whenever a preedit becomes visible, after which
+   `FocusOut` and `Reset` return without doing anything (`:1307-1311`,
+   `:1332-1338`). That would break the turn-taking design, which resets the
+   context on entering dictation. We use `"wayland-cosmic-voice"`. The
+   "Wayland session" predicate is "some panel has called
+   `SetGlobalShortcutKeys`" (`bus/ibusimpl.c:2667-2670`), so the trap arms
+   itself the moment phase 4 registers the trigger.
+2. **`ActiveEngines` is empty** (977 registry engines, 0 active) even with
+   `xkb:us::eng` and `mozc-jp` configured; the daemon only fills it from
+   loaded components. Engine cycling reads dconf
+   `org.freedesktop.ibus.general preload-engines` (`['xkb:us::eng',
+   'mozc-jp']` here) and resolves through `GetEnginesByNames`.
+3. **zbus's blocking API owns a runtime.** Polling a `MessageStream` ticks the
+   connection's internal executor, which holds the tokio socket; polling it
+   from any other runtime panics ("there is no reactor running"). Phase 1
+   routes signal waits through `zbus::block_on` with the timer constructed
+   inside the future. Phase 2 cannot simply register the socket with calloop;
+   see open decision 1.
+4. `PostProcessKeyEvent` introspects as `(a(yv))` but the getter returns a
+   bare `a(yv)` (`bus/inputcontext.c:260` vs `:1639-1648`). The decoder
+   accepts both. The record encoding is: tag byte + `IBusText`, with
+   non-text payloads printf'd into the text — `'c'` commit, `'d'`
+   delete-surrounding `"%d,%u"` (signed offset), `'f'` forward-key
+   `"%u,%u,%u"`, `'h'`/`'s'` hide/show preedit, `'r'` require-surrounding,
+   `'u'` update-preedit as two records (text, then `"%u,%u"` cursor,visible),
+   `'m'` update-preedit-with-mode as two records (text, then `"%u,%u,%u"`).
+   `'m'` replaces `'u'` exactly when `ClientCommitPreedit` is set
+   (`:3505-3507`); the queue caps at 30 (`MAX_SYNC_DATA`, `:34`).
+5. **`DeleteSurroundingText` and `RequireSurroundingText` are emitted but not
+   in the introspection XML** (`:2666-2686`, `:2693-2709`). Anything generated
+   from introspection misses both; the phase-2 mapping depends on both.
+6. **`GlobalShortcutKeys` and `PreloadEngines` are write-only** despite
+   introspecting rw (`bus/ibusimpl.c:2142-2147`). Phase 4 cannot read back
+   what it registered; keep the triggers client-side.
+7. **Preedit delivery has a precondition**: `PREEDIT_CONDITION`
+   (`bus/inputcontext.c:378-383`) sends preedit to the client only if
+   `CAP_PREEDIT_TEXT` and (`EmbedPreeditText` or `CAP_FOCUS` unset).
+   `EmbedPreeditText` is a daemon-global (true here) that any client can flip;
+   with it off and our capabilities set, preedit goes to a panel that no
+   longer exists. `devtest ibus-info` prints it; the frontend should assert it.
+8. Minor: `IBUS_IGNORED_MASK` aliases `IBUS_FORWARD_MASK` (bit 25,
+   `ibustypes.h:91`); the daemon drives sync mode from the
+   `EffectivePostProcessKeyEvent` property, not `CAP_SYNC_PROCESS_KEY`;
+   `mozc-jp` declares layout `default`, so the frontend's routing rule 3
+   (commit plain printables as text) is what actually runs for it; zbus 5.19
+   ships `connection::Builder::ibus()` but it shells out to `ibus address`
+   and skips PID validation, so we discover the address ourselves.

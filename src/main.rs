@@ -16,6 +16,7 @@ mod config;
 mod devtest;
 mod engine;
 mod hotkey;
+mod ibus;
 mod inject;
 mod ipc;
 mod toplevel;

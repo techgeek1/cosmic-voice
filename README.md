@@ -48,6 +48,26 @@ machine.
   keyed by focused app_id) is scaffolded but not wired up yet; the config
   fields exist and default to empty.
 
+## Input-method multiplexer
+
+`docs/multiplexer.md` designs the next version: one process owns the seat's
+`zwp_input_method_v2` slot and multiplexes it between dictation and IBus, so
+typed CJK and spoken text stop competing for a compositor slot that has no
+sharing semantics. Phase one of it is in the tree and nothing shipped uses it
+yet. `src/ibus` is a hand-written D-Bus client for ibus-daemon's own private
+bus: address discovery, the `IBusSerializable` codec for preedit, candidates
+and engine descriptions, and the synchronous key path where `ProcessKeyEvent`
+blocks and the effects it withheld are drained back out of a property. There
+is no Wayland side to it, so it neither binds the input-method slot nor
+changes how anything types today.
+
+Two hidden devtests exercise it. `cosmic-voice devtest ibus-info` is read-only
+— it connects, decodes the engine registry and reports what the daemon says —
+and is safe to run at any time. `cosmic-voice devtest ibus-keys <engine>
+<key>…` feeds a scripted key sequence to a real engine and prints what came
+back; it is **attended only**, because taking IBus focus takes it away from
+whatever window you were actually typing in until it exits.
+
 ## Setup
 
 Map a key to F13 on your keyboard (e.g. via VIA/Keychron Launcher) or rebind
@@ -97,3 +117,4 @@ rest mirror it, so every panel icon works and nothing runs multiplied.
 | `ipc.rs`       | the applet/engine boundary                        |
 | `transcript_log.rs` | raw transcript corpus, one JSON line per utterance |
 | `app.rs`       | panel applet, icon and settings popup             |
+| `ibus/`        | D-Bus client for ibus-daemon, the multiplexer's upstream leg |

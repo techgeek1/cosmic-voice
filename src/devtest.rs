@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::asr::{Recognizer, SAMPLE_RATE, StreamingRecognizer};
 use crate::engine::TICK_MS;
@@ -28,6 +28,10 @@ pub fn run(args: &[String]) -> Result<()> {
         [c] if c == "engine"             => engine(),
         [c] if c == "inject-probe"       => inject_probe(false),
         [c, secs, text] if c == "type"   => type_text(secs.parse()?, text),
+        [c] if c == "ibus-info"          => ibus_info(),
+        // ATTENDED ONLY: takes IBus focus away from real windows for as long
+        // as it runs. See the warning it prints.
+        [c, engine, keys @ ..] if c == "ibus-keys" => ibus_keys(engine, keys),
         // DANGER: binds the seat's input-method slot. With IBus's Wayland IM
         // running this has wedged all keyboard input; recovery is
         // `ibus exit; pkill -f ibus-ui-gtk3`. Run only deliberately.
@@ -35,7 +39,7 @@ pub fn run(args: &[String]) -> Result<()> {
         _ => Err(anyhow!(
             "checks: decode <model_dir> <wav> [threads] | stream <model_dir> <wav> [threads] | \
              finalize <model_dir> <wav> [threads] | capture <secs> | keys | rebind | \
-             inject-probe | type <secs> <text>"
+             inject-probe | type <secs> <text> | ibus-info | ibus-keys <engine> <key>…"
         )),
     }
 }
@@ -291,4 +295,224 @@ fn type_text(secs: u64, text: &str) -> Result<()> {
     println!("done");
 
     Ok(())
+}
+
+/// Reads everything the ibus client can read without creating anything.
+///
+/// The safe half of the phase-1 acceptance test for `src/ibus`: it proves the
+/// address file parses, that the private bus really is a message bus (a
+/// `Hello` happened, so we have a unique name), and that the
+/// `IBusSerializable` codec agrees with what the live daemon actually sends —
+/// which is the part no unit test can establish, because the fixtures come
+/// from the same reading of the source as the decoder.
+///
+/// Creates no input context and takes no focus, so it is safe to run at any
+/// time against the session's real daemon.
+fn ibus_info() -> Result<()> {
+    let bus = crate::ibus::Bus::connect()?;
+    let address = bus.address();
+
+    println!("source        {}", address.source);
+    println!("address       {}", address.address);
+    println!(
+        "daemon pid    {}",
+        address.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+    );
+    println!("unique name   {}", bus.unique_name());
+    println!("daemon says   {}", bus.daemon_address()?);
+    println!("ping          {:?}", bus.ping("cosmic-voice")?);
+    println!("embed preedit {}", bus.embed_preedit_text()?);
+    println!("focused ctx   {}", bus.current_input_context()?);
+
+    // Write-only in the daemon despite introspecting as readable, so the
+    // interesting outcome here is the error.
+    match bus.global_shortcut_keys() {
+        Ok((kind, keys)) => println!("shortcut keys type {kind}, {} binding(s)", keys.len()),
+        Err(e)           => println!("shortcut keys unreadable: {e}"),
+    }
+
+    let global = bus.global_engine()?;
+    println!("\nglobal engine\n{}", indent(&global.detail()));
+
+    let engines = bus.engines()?;
+    let active = bus.active_engines()?;
+    println!("\nregistry      {} engines, {} active", engines.len(), active.len());
+    for engine in &active {
+        println!("  active      {engine}");
+    }
+
+    // dconf is where the user's engine order actually lives; the daemon's
+    // ActiveEngines is derived from it, and phase 4 cycles through the same
+    // list. Shelling out beats linking gio for one string.
+    match std::process::Command::new("gsettings")
+        .args(["get", "org.freedesktop.ibus.general", "preload-engines"])
+        .output()
+    {
+        Ok(output) if output.status.success() => println!(
+            "  dconf       {}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+        ),
+        Ok(output) => println!("  dconf       gsettings failed: {}", output.status),
+        Err(e)     => println!("  dconf       gsettings unavailable: {e}"),
+    }
+
+    let wanted = ["mozc-jp", "xkb:us::eng"];
+    println!("\nGetEnginesByNames({wanted:?})");
+    for engine in bus.engines_by_names(&wanted)? {
+        println!("{}", indent(&engine.detail()));
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Feeds a scripted key sequence to an engine through a real input context.
+///
+/// **Attended only.** It calls `FocusIn`, which takes the engine away from
+/// whatever window the user is actually typing in, for as long as it runs.
+///
+/// Each key spec is either an xkbcommon keysym name (`a`, `space`, `Return`,
+/// `Muhenkan`) or a single literal character, optionally suffixed with
+/// `/<evdev code>` to supply a hardware keycode — IBus's convention, which
+/// every engine is tested against, is evdev+8, and that offset is applied
+/// here. Without a suffix the keycode is sent as 0, which engines that only
+/// look at the keysym accept.
+///
+/// Every key is sent twice, press then release with [`crate::ibus::RELEASE_MASK`],
+/// because engines that latch on release (mozc's Henkan handling among them)
+/// misbehave when a client only sends presses.
+fn ibus_keys(engine: &str, keys: &[String]) -> Result<()> {
+    use crate::ibus::{RELEASE_MASK, Text, describe_capabilities};
+
+    println!("!! WARNING: this steals IBus focus from your real windows while it runs.");
+    println!("!! Keys typed elsewhere will go to this context until it exits.\n");
+
+    let bus = crate::ibus::Bus::connect()?;
+    let mut context = bus.create_input_context(crate::ibus::CLIENT_NAME)?;
+    println!("context       {}", context.path());
+    println!("capabilities  {}", describe_capabilities(crate::ibus::CAPABILITIES));
+
+    context.set_engine(engine)?;
+    println!("engine        {}", context.engine()?);
+
+    // A caret rectangle and an empty surrounding text before focus, so the
+    // engine never sees the "client declared the capability but never answered"
+    // state that some engines log about.
+    context.set_cursor_location(0, 0, 0, 0)?;
+    context.set_surrounding_text(&Text::plain(""), 0, 0)?;
+
+    context.focus_in()?;
+    println!("focus         in\n");
+
+    for spec in keys {
+        let (keyval, keycode) = parse_key_spec(spec)?;
+        for state in [0, RELEASE_MASK] {
+            let outcome = context.process_key(keyval, keycode, state)?;
+            println!(
+                "{spec:>12}  {}  handled={}  {} record(s)",
+                if state == 0 { "press  " } else { "release" },
+                outcome.handled,
+                outcome.records.len(),
+            );
+            for record in &outcome.records {
+                println!("              -> {record}");
+            }
+        }
+        drain_signals(&mut context, Duration::from_millis(100))?;
+    }
+
+    println!("\nwaiting 2s for asynchronous signals…");
+    drain_signals(&mut context, Duration::from_secs(2))?;
+
+    // Reset before dropping focus so a half-finished conversion does not
+    // linger in the engine for whoever gets focus next.
+    context.reset()?;
+    context.focus_out()?;
+    println!("\nreset, focus  out");
+    // Dropping the context destroys it in the daemon.
+
+    Ok(())
+}
+
+/// Prints every signal that arrives within `window`.
+fn drain_signals(context: &mut crate::ibus::Context, window: Duration) -> Result<()> {
+    let deadline = Instant::now() + window;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match context.next_signal(Some(remaining))? {
+            Some(signal) => println!("              ~> {signal}"),
+            None         => break,
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolves a key spec to an X keysym and an IBus keycode.
+fn parse_key_spec(spec: &str) -> Result<(u32, u32)> {
+    use xkbcommon::xkb;
+
+    let (name, evdev) = match spec.split_once('/') {
+        Some((name, code)) => (name, code.parse::<u32>()?),
+        None               => (spec, 0),
+    };
+
+    let mut keysym = xkb::keysym_from_name(name, xkb::KEYSYM_NO_FLAGS);
+    if keysym == xkb::Keysym::NoSymbol
+        && let Some(character) = name.chars().next()
+        && name.chars().count() == 1
+    {
+        keysym = xkb::utf32_to_keysym(character as u32);
+    }
+    if keysym == xkb::Keysym::NoSymbol {
+        return Err(anyhow!("{spec:?}: not an xkb keysym name or a single character"));
+    }
+
+    // The GTK convention every engine is tested against, and the daemon passes
+    // the value through untouched. 0 means "we do not know", which is what a
+    // spec without a hardware code gets.
+    let keycode = if evdev == 0 { 0 } else { evdev + 8 };
+
+    Ok((keysym.raw(), keycode))
+}
+
+/// Indents a multi-line block for the report layout.
+fn indent(block: &str) -> String {
+    block
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_spec;
+
+    /// The keysym resolution in `ibus-keys` is the one part of that check that
+    /// can be verified without a daemon and without stealing anybody's focus,
+    /// so it is worth pinning: a wrong keysym looks exactly like an engine
+    /// that ignored the key.
+    #[test]
+    fn resolves_keysym_names_and_literals() {
+        assert_eq!(parse_key_spec("a").expect("a").0, 0x0061);
+        assert_eq!(parse_key_spec("space").expect("space").0, 0x0020);
+        assert_eq!(parse_key_spec("Return").expect("Return").0, 0xff0d);
+        // Not an xkb name, so it falls through to the literal path.
+        assert_eq!(parse_key_spec("あ").expect("hiragana a").0, 0x0100_3042);
+    }
+
+    /// IBus keycodes are evdev+8, the GTK convention every engine is tested
+    /// against; an unsuffixed spec means "we do not know the hardware code".
+    #[test]
+    fn applies_the_evdev_offset() {
+        assert_eq!(parse_key_spec("a/30").expect("a/30").1, 38);
+        assert_eq!(parse_key_spec("a").expect("a").1, 0);
+    }
+
+    #[test]
+    fn rejects_a_name_that_is_neither() {
+        assert!(parse_key_spec("NotAKeysymName").is_err());
+    }
 }
