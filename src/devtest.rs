@@ -382,7 +382,7 @@ fn ibus_info() -> Result<()> {
 /// because engines that latch on release (mozc's Henkan handling among them)
 /// misbehave when a client only sends presses.
 fn ibus_keys(engine: &str, keys: &[String]) -> Result<()> {
-    use crate::ibus::{RELEASE_MASK, Text, describe_capabilities};
+    use crate::ibus::describe_capabilities;
 
     println!("!! WARNING: this steals IBus focus from your real windows while it runs.");
     println!("!! Keys typed elsewhere will go to this context until it exits.\n");
@@ -392,8 +392,31 @@ fn ibus_keys(engine: &str, keys: &[String]) -> Result<()> {
     println!("context       {}", context.path());
     println!("capabilities  {}", describe_capabilities(crate::ibus::CAPABILITIES));
 
-    context.set_engine(engine)?;
-    println!("engine        {}", context.engine()?);
+    // With use-global-engine on (the default) the daemon refuses per-context
+    // SetEngine; the global engine is the only switch, and it moves the user's
+    // real windows with it, so it is put back afterwards whatever happens.
+    let previous = bus.global_engine()?.name;
+    let switched = match context.set_engine(engine) {
+        Ok(())  => false,
+        Err(e)  => {
+            println!("engine        SetEngine refused ({e}); switching the global engine");
+            bus.set_global_engine(engine)?;
+            true
+        }
+    };
+    let result = ibus_keys_session(&mut context, keys);
+    if switched {
+        bus.set_global_engine(&previous)?;
+        println!("global engine restored to {previous}");
+    }
+
+    result
+}
+
+/// The focused part of `ibus-keys`, split out so the engine switch around it
+/// is undone on every exit path.
+fn ibus_keys_session(context: &mut crate::ibus::Context, keys: &[String]) -> Result<()> {
+    use crate::ibus::{RELEASE_MASK, Text};
 
     // A caret rectangle and an empty surrounding text before focus, so the
     // engine never sees the "client declared the capability but never answered"
@@ -402,7 +425,11 @@ fn ibus_keys(engine: &str, keys: &[String]) -> Result<()> {
     context.set_surrounding_text(&Text::plain(""), 0, 0)?;
 
     context.focus_in()?;
-    println!("focus         in\n");
+    // Only meaningful after focus: with use-global-engine the daemon attaches
+    // the engine to whichever context is focused, and before that it is the
+    // placeholder "dummy".
+    println!("focus         in");
+    println!("engine        {}\n", context.engine()?);
 
     for spec in keys {
         let (keyval, keycode) = parse_key_spec(spec)?;
@@ -418,11 +445,11 @@ fn ibus_keys(engine: &str, keys: &[String]) -> Result<()> {
                 println!("              -> {record}");
             }
         }
-        drain_signals(&mut context, Duration::from_millis(100))?;
+        drain_signals(context, Duration::from_millis(100))?;
     }
 
     println!("\nwaiting 2s for asynchronous signals…");
-    drain_signals(&mut context, Duration::from_secs(2))?;
+    drain_signals(context, Duration::from_secs(2))?;
 
     // Reset before dropping focus so a half-finished conversion does not
     // linger in the engine for whoever gets focus next.

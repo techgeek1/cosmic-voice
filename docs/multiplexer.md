@@ -371,3 +371,15 @@ turned up these corrections. Citations are into the 1.5.34 tree.
    (commit plain printables as text) is what actually runs for it; zbus 5.19
    ships `connection::Builder::ibus()` but it shells out to `ibus address`
    and skips PID validation, so we discover the address ourselves.
+9. **Per-context `SetEngine` is refused** while dconf `use-global-engine`
+   is true (the default): "Cannot set engines when use-global-engine is
+   enabled". `SetGlobalEngine` is the only switch, it moves every window at
+   once, and the engine attaches to a context only on `FocusIn` (before that
+   `GetEngine` answers the placeholder `dummy`). Engine switching in phase 4
+   is therefore global by construction, which matches the panel's semantics.
+10. **`mozc-jp` starts in direct mode** (`active_on_launch: False` in the
+   user's `ibus_config.textproto`) and passes every key through unhandled;
+   `mozc-on` starts in hiragana. Live run 2026-08-26 through `ibus-keys`:
+   every press `handled=true`, preedit arrives in the drain as `'m'` records
+   with `mode=commit`, lookup tables and auxiliary text arrive as ordinary
+   signals, `CommitText` lands in the drain on Return. The sync contract holds.

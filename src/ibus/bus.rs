@@ -229,6 +229,16 @@ impl Bus {
         EngineDesc::from_value(&value)
     }
 
+    /// Switches the engine in effect for every context.
+    ///
+    /// With `use-global-engine` set (the default), the daemon refuses
+    /// per-context `SetEngine`, so this is the only way to pick an engine —
+    /// and it changes it for the user's real windows too. Callers that switch
+    /// for their own purposes must put the previous engine back.
+    pub fn set_global_engine(&self, name: &str) -> Result<()> {
+        Ok(self.daemon.set_global_engine(name)?)
+    }
+
     /// Every engine in the registry, decoded.
     pub fn engines(&self) -> Result<Vec<EngineDesc>> {
         decode_engines(self.daemon.engines()?)
