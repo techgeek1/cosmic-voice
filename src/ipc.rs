@@ -30,6 +30,12 @@ pub enum Command {
     /// `Event` back as newline JSON, and keeps reading commands. Used by the
     /// non-primary applet instances the panel spawns (one per output).
     Subscribe,
+    /// Start or stop appending committed transcripts to the corpus log.
+    /// Independent of `Enable`/`Disable`; accepted while disarmed.
+    SetLogging(bool),
+    /// Take the next key pressed on any keyboard as the new trigger. Aborts
+    /// anything in flight; answered by `Event::Trigger` either way.
+    Rebind,
 }
 
 /// Engine state transitions, consumed by the applet to drive the panel icon.
@@ -54,6 +60,15 @@ pub enum Event {
     /// The trigger is disarmed; key presses and start commands are ignored
     /// until `Enable`. Ends with an `Idle` when re-armed.
     Disabled,
+    /// Transcript logging was switched, or is being reported to a new
+    /// subscriber. Orthogonal to the capture state above.
+    Logging { enabled: bool },
+    /// Waiting for the user to press the key that becomes the new trigger.
+    /// Ends with a `Trigger`.
+    Rebinding,
+    /// The trigger key in effect: at startup, after a rebind, or reported to
+    /// a new subscriber. Orthogonal to the capture state.
+    Trigger { code: u16 },
 }
 
 /// Returns the socket path, `$XDG_RUNTIME_DIR/cosmic-voice.sock`.
@@ -112,8 +127,23 @@ pub fn send_blocking(cmd: Command) -> Result<()> {
     Ok(())
 }
 
-/// The engine's most recent state event, for bringing late mirrors current.
-pub type Latest = std::sync::Arc<std::sync::Mutex<Option<Event>>>;
+/// What a late mirror needs to become current.
+///
+/// Two independent pieces because the event stream carries two independent
+/// things: where the capture cycle is, and whether logging is on. Replaying
+/// only the most recent event would lose whichever one it was not.
+#[derive(Debug, Default)]
+pub struct Snapshot {
+    /// Most recent capture-state event.
+    pub state   : Option<Event>,
+    /// Whether transcript logging is on.
+    pub logging : bool,
+    /// The trigger key in effect.
+    pub trigger : u16,
+}
+
+/// The engine's snapshot, shared with the control socket.
+pub type Latest = std::sync::Arc<std::sync::Mutex<Snapshot>>;
 
 /// Accepts connections for the process lifetime, forwarding parsed commands.
 ///
@@ -150,8 +180,18 @@ pub async fn serve(
                             Ok(Command::Subscribe) if rx.is_none() => {
                                 rx = Some(events.subscribe());
                                 // Catch the mirror up before live events flow.
-                                let snapshot = latest.lock().unwrap().clone();
-                                if let Some(event) = snapshot
+                                let (state, logging, trigger) = {
+                                    let snapshot = latest.lock().unwrap();
+                                    (snapshot.state.clone(), snapshot.logging, snapshot.trigger)
+                                };
+                                let logging = Event::Logging { enabled: logging };
+                                let trigger = Event::Trigger { code: trigger };
+                                if write_event(&mut write, &logging).await.is_err()
+                                    || write_event(&mut write, &trigger).await.is_err()
+                                {
+                                    return;
+                                }
+                                if let Some(event) = state
                                     && write_event(&mut write, &event).await.is_err()
                                 {
                                     return;

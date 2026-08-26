@@ -15,6 +15,12 @@
 //! against us, the trigger has to leave the keyboard on a different endpoint
 //! entirely, which means a QMK raw-HID report on the vendor interface.
 //!
+//! The one deliberate exception is rebinding. To learn which key the user
+//! wants, the watcher briefly opens every keyboard with no key mask at all and
+//! takes the first press; that is a user-initiated window of at most
+//! [`CAPTURE_WINDOW`], after which the narrow mask goes back on. See
+//! [`Watcher::run_blocking`].
+//!
 //! No elevated access is required. logind tags input devices `uaccess` and puts
 //! an ACL for the active session's user on them.
 
@@ -23,7 +29,19 @@ use rustix::event::{PollFd, PollFlags};
 use rustix::io::Errno;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
+
+/// How long a rebind waits for a key before giving up.
+pub const CAPTURE_WINDOW: Duration = Duration::from_secs(10);
+
+/// `KEY_ESC`, which cancels a rebind rather than becoming the trigger.
+const KEY_ESC: u16 = 1;
+
+/// First code of the `BTN_*` range. Anything at or above it is a button, not a
+/// key, and is never offered as a trigger.
+const BTN_MISC: u16 = 0x100;
 
 /// evdev event type for key state changes.
 const EV_KEY: u16 = 0x01;
@@ -81,18 +99,82 @@ pub enum KeyEdge {
     Released,
 }
 
+/// Everything the watcher sends to the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyEvent {
+    /// The trigger changed state.
+    Edge(KeyEdge),
+    /// A rebind finished. `Some` carries the new trigger, already in effect;
+    /// `None` means the window expired or the user pressed Escape, and the
+    /// old trigger is back in effect.
+    Rebound(Option<u16>),
+}
+
+/// Requests into the watcher thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    /// Open every keyboard unmasked and take the next key press as the trigger.
+    Capture,
+}
+
+/// The engine's handle on the watcher thread.
+///
+/// The thread blocks in `poll(2)`, so a request has two halves: the payload
+/// through a mutex, and a write to an eventfd that sits in the poll set to
+/// wake the thread up and make it look.
+#[derive(Clone)]
+pub struct Control {
+    /// Pending requests, drained by the thread when the eventfd fires.
+    pending : Arc<Mutex<Vec<Request>>>,
+    /// Wakeup for the poll loop.
+    wake    : Arc<OwnedFd>,
+}
+
+impl Control {
+    /// Asks the watcher to rebind. The outcome arrives as
+    /// [`HotkeyEvent::Rebound`] on the event channel.
+    pub fn capture(&self) {
+        self.pending.lock().unwrap().push(Request::Capture);
+        // A full counter is the only failure, and it means the thread is
+        // already due to wake; the request is queued either way.
+        let _ = rustix::io::write(&self.wake, &1u64.to_ne_bytes());
+    }
+}
+
+/// What the poll loop is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Watching the trigger through the narrow mask.
+    Watching,
+    /// Unmasked, waiting for any key press until the deadline.
+    Capturing { until: Instant },
+}
+
 // --- Watcher ---
 
 /// Watches every keyboard that can emit the trigger, across hotplug.
 pub struct Watcher {
     /// evdev code being watched, e.g. 183 for `KEY_F13`.
     trigger : u16,
+    /// What the loop is currently doing.
+    mode    : Mode,
+    /// Requests from the engine.
+    control : Control,
 }
 
 impl Watcher {
-    /// Creates a watcher for the given evdev key code.
-    pub fn new(trigger: u16) -> Self {
-        Self { trigger: trigger }
+    /// Creates a watcher for the given evdev key code, and the handle the
+    /// engine drives it with.
+    pub fn new(trigger: u16) -> Result<(Self, Control)> {
+        let wake = rustix::event::eventfd(
+            0,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )
+        .context("creating the watcher eventfd")?;
+        let control = Control { pending: Arc::default(), wake: Arc::new(wake) };
+        let watcher = Self { trigger: trigger, mode: Mode::Watching, control: control.clone() };
+
+        Ok((watcher, control))
     }
 
     /// Runs until the receiver goes away, sending every press and release.
@@ -109,7 +191,13 @@ impl Watcher {
     /// physical key can also be advertised by several endpoints of one
     /// keyboard, so only *transitions* of a shared held-state are reported,
     /// whichever descriptor delivers them first.
-    pub fn run_blocking(&mut self, tx: Sender<KeyEdge>) -> Result<()> {
+    ///
+    /// A rebind request switches the loop into capture mode: every keyboard is
+    /// reopened with no key mask, and the first key press (Escape excepted)
+    /// becomes the trigger. The window closes on that press or after
+    /// [`CAPTURE_WINDOW`], and either way the descriptors are rebuilt with the
+    /// narrow mask before anything else is read.
+    pub fn run_blocking(&mut self, tx: Sender<HotkeyEvent>) -> Result<()> {
         let monitor = udev::MonitorBuilder::new()
             .and_then(|m| m.match_subsystem("input"))
             .and_then(|m| m.listen())
@@ -118,11 +206,17 @@ impl Watcher {
         let mut held = false;
 
         'rebuild: loop {
+            let capturing = matches!(self.mode, Mode::Capturing { .. });
             let mut devices: Vec<OwnedFd> = Vec::new();
-            for path in self.discover()? {
-                match open_filtered(&path, self.trigger) {
+            for path in self.discover(capturing)? {
+                let opened = if capturing {
+                    open_unmasked(&path)
+                } else {
+                    open_filtered(&path, self.trigger)
+                };
+                match opened {
                     Ok(fd) => {
-                        tracing::info!("watching {} for the trigger", path.display());
+                        tracing::info!("watching {}", path.display());
                         drain(&fd);
                         devices.push(fd);
                     }
@@ -136,21 +230,56 @@ impl Watcher {
             }
 
             loop {
-                let mut polls: Vec<PollFd> = Vec::with_capacity(devices.len() + 1);
+                let mut polls: Vec<PollFd> = Vec::with_capacity(devices.len() + 2);
                 polls.push(PollFd::new(&monitor, PollFlags::IN));
+                polls.push(PollFd::new(&self.control.wake, PollFlags::IN));
                 for fd in &devices {
                     polls.push(PollFd::new(fd, PollFlags::IN));
                 }
-                rustix::event::poll(&mut polls, None).context("poll")?;
+                let timeout = match self.mode {
+                    Mode::Watching            => None,
+                    Mode::Capturing { until } => {
+                        let left = until.saturating_duration_since(Instant::now());
+                        Some(rustix::event::Timespec {
+                            tv_sec  : left.as_secs() as _,
+                            tv_nsec : left.subsec_nanos() as _,
+                        })
+                    }
+                };
+                rustix::event::poll(&mut polls, timeout.as_ref()).context("poll")?;
 
                 let monitor_ready = polls[0].revents().contains(PollFlags::IN);
-                let ready: Vec<usize> = polls[1..]
+                let wake_ready    = polls[1].revents().contains(PollFlags::IN);
+                let ready: Vec<usize> = polls[2..]
                     .iter()
                     .enumerate()
                     .filter(|(_, p)| !p.revents().is_empty())
                     .map(|(i, _)| i)
                     .collect();
                 drop(polls);
+
+                if wake_ready {
+                    let mut buf = [0u8; 8];
+                    let _ = rustix::io::read(&self.control.wake, &mut buf);
+                    let requests = std::mem::take(&mut *self.control.pending.lock().unwrap());
+                    if requests.contains(&Request::Capture) && !capturing {
+                        tracing::info!("rebinding: waiting for a key press");
+                        self.mode = Mode::Capturing { until: Instant::now() + CAPTURE_WINDOW };
+                        held = false;
+                        continue 'rebuild;
+                    }
+                }
+
+                if let Mode::Capturing { until } = self.mode
+                    && Instant::now() >= until
+                {
+                    tracing::info!("rebinding: timed out");
+                    self.mode = Mode::Watching;
+                    if tx.blocking_send(HotkeyEvent::Rebound(None)).is_err() {
+                        return Ok(());
+                    }
+                    continue 'rebuild;
+                }
 
                 if monitor_ready {
                     let changed = monitor.iter().any(|ev| {
@@ -166,13 +295,31 @@ impl Watcher {
                 for index in ready {
                     loop {
                         match read_events(&devices[index]) {
+                            Ok(events) if capturing => {
+                                let Some(code) = events.iter().find_map(pressed_key) else {
+                                    continue;
+                                };
+                                let chosen = (code != KEY_ESC).then_some(code);
+                                match chosen {
+                                    Some(code) => {
+                                        tracing::info!("rebinding: trigger is now {code}");
+                                        self.trigger = code;
+                                    }
+                                    None => tracing::info!("rebinding: cancelled"),
+                                }
+                                self.mode = Mode::Watching;
+                                if tx.blocking_send(HotkeyEvent::Rebound(chosen)).is_err() {
+                                    return Ok(());
+                                }
+                                continue 'rebuild;
+                            }
                             Ok(events) => {
                                 for ev in &events {
                                     let Some(edge) = decode(ev, self.trigger) else { continue };
                                     let down = edge == KeyEdge::Pressed;
                                     if held != down {
                                         held = down;
-                                        if tx.blocking_send(edge).is_err() {
+                                        if tx.blocking_send(HotkeyEvent::Edge(edge)).is_err() {
                                             return Ok(());
                                         }
                                     }
@@ -191,11 +338,12 @@ impl Watcher {
 }
 
 impl Watcher {
-    /// Finds every `/dev/input/event*` whose key bitmap advertises the trigger.
+    /// Finds every `/dev/input/event*` whose key bitmap advertises the trigger,
+    /// or, when `any_key`, any key at all.
     ///
     /// QMK boards expose several HID interfaces and the trigger may arrive on
     /// any of them, so this matches on capability rather than on device name.
-    fn discover(&self) -> Result<Vec<PathBuf>> {
+    fn discover(&self, any_key: bool) -> Result<Vec<PathBuf>> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir("/dev/input").context("listing /dev/input")? {
             let path = entry.context("reading /dev/input")?.path();
@@ -203,7 +351,18 @@ impl Watcher {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("event"));
-            if is_event && advertises(&path, self.trigger) {
+            if !is_event {
+                continue;
+            }
+            let Some(bits) = key_capabilities(&path) else { continue };
+            let wanted = if any_key {
+                // Only the KEY_ range counts; a mouse advertising BTN_ codes
+                // alone is not a keyboard.
+                bits[..BTN_MISC as usize / 8].iter().any(|b| *b != 0)
+            } else {
+                bits[self.trigger as usize / 8] & (1 << (self.trigger % 8)) != 0
+            };
+            if wanted {
                 found.push(path);
             }
         }
@@ -213,23 +372,21 @@ impl Watcher {
     }
 }
 
-/// Whether the device at `path` can emit `trigger` at all.
+/// Reads the key-capability bitmap of the device at `path`.
 ///
-/// Returns false for devices we cannot open; those are also devices we could
+/// Returns `None` for devices we cannot open; those are also devices we could
 /// never read, so they are simply not candidates.
-fn advertises(path: &Path, trigger: u16) -> bool {
+fn key_capabilities(path: &Path) -> Option<[u8; KEY_BITMAP_LEN]> {
     use rustix::fs::{Mode, OFlags, open};
 
-    let Ok(fd) = open(path, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()) else {
-        return false;
-    };
+    let fd = open(path, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()).ok()?;
 
     let mut bits = [0u8; KEY_BITMAP_LEN];
     // SAFETY: `bits` lives across the call and is exactly the length the ioctl
     // number encodes; the descriptor is a live evdev node.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), EVIOCGBIT_KEY, bits.as_mut_ptr()) };
 
-    rc >= 0 && bits[trigger as usize / 8] & (1 << (trigger % 8)) != 0
+    (rc >= 0).then_some(bits)
 }
 
 /// Reads and parses whatever complete events are currently available.
@@ -300,6 +457,27 @@ pub fn open_filtered(path: &Path, trigger: u16) -> Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Opens an evdev node for rebinding: every key is delivered, scancodes are not.
+///
+/// Only ever used inside a capture window, and every descriptor opened this
+/// way is closed when the window ends. `MSC_SCAN` stays suppressed because the
+/// key code is all a rebind needs.
+fn open_unmasked(path: &Path) -> Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let fd = open(path, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())
+        .with_context(|| format!("opening {}", path.display()))?;
+
+    let msc_mask = InputMask {
+        type_      : EV_MSC as u32,
+        codes_size : 0,
+        codes_ptr  : 0,
+    };
+    ioctl_set_mask(&fd, &msc_mask).context("suppressing MSC_SCAN scancodes")?;
+
+    Ok(fd)
+}
+
 /// Issues `EVIOCSMASK` on a descriptor.
 fn ioctl_set_mask(fd: &OwnedFd, mask: &InputMask) -> Result<()> {
     use std::os::fd::AsRawFd;
@@ -317,6 +495,11 @@ fn ioctl_set_mask(fd: &OwnedFd, mask: &InputMask) -> Result<()> {
     Ok(())
 }
 
+/// The key code of a press event in the `KEY_` range, for rebinding.
+fn pressed_key(ev: &InputEvent) -> Option<u16> {
+    (ev.type_ == EV_KEY && ev.value == 1 && ev.code < BTN_MISC).then_some(ev.code)
+}
+
 /// Decodes one `input_event` into an edge, ignoring autorepeat.
 ///
 /// Autorepeat arrives as `value == 2` while the key is held. Treating it as a
@@ -331,4 +514,42 @@ fn decode(ev: &InputEvent, trigger: u16) -> Option<KeyEdge> {
         1 => Some(KeyEdge::Pressed),
         _ => None,
     }
+}
+
+/// A human-readable name for an evdev key code, for the applet.
+///
+/// Covers the keys anyone would plausibly bind; everything else is shown by
+/// number, which is also what the config file takes.
+pub fn key_name(code: u16) -> String {
+    let name = match code {
+        1        => "Esc",
+        29       => "Left Ctrl",
+        41       => "`",
+        42       => "Left Shift",
+        54       => "Right Shift",
+        56       => "Left Alt",
+        58       => "Caps Lock",
+        59..=68  => return format!("F{}", code - 58),
+        69       => "Num Lock",
+        70       => "Scroll Lock",
+        87       => "F11",
+        88       => "F12",
+        97       => "Right Ctrl",
+        99       => "SysRq",
+        100      => "Right Alt",
+        102      => "Home",
+        104      => "Page Up",
+        107      => "End",
+        109      => "Page Down",
+        110      => "Insert",
+        111      => "Delete",
+        119      => "Pause",
+        125      => "Left Meta",
+        126      => "Right Meta",
+        127      => "Menu",
+        183..=194 => return format!("F{}", code - 170),
+        _        => return format!("key {code}"),
+    };
+
+    name.to_owned()
 }

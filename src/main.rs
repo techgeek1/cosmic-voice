@@ -19,6 +19,7 @@ mod hotkey;
 mod inject;
 mod ipc;
 mod toplevel;
+mod transcript_log;
 mod vad;
 
 use anyhow::Result;
@@ -47,9 +48,18 @@ fn main() -> Result<()> {
         Some("cancel") => ipc::send_blocking(Command::Cancel),
         Some("enable") => ipc::send_blocking(Command::Enable),
         Some("disable") => ipc::send_blocking(Command::Disable),
+        Some("rebind") => ipc::send_blocking(Command::Rebind),
+        Some("log")    => match args.get(1).map(String::as_str) {
+            Some("on")  => ipc::send_blocking(Command::SetLogging(true)),
+            Some("off") => ipc::send_blocking(Command::SetLogging(false)),
+            _ => {
+                eprintln!("usage: cosmic-voice log on|off");
+                std::process::exit(2);
+            }
+        },
         Some(other)    => {
             eprintln!("cosmic-voice: unknown command {other:?}");
-            eprintln!("usage: cosmic-voice [start|stop|toggle|cancel|enable|disable]");
+            eprintln!("usage: cosmic-voice [start|stop|toggle|cancel|enable|disable|rebind|log on|off]");
             std::process::exit(2);
         }
     }

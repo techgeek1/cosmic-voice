@@ -79,6 +79,11 @@ pub struct Config {
     /// already grants here. A small boost keeps dictation responsive when the
     /// machine is saturated without meaningfully slowing anything else.
     pub asr_nice            : i32,
+    /// Whether transcript logging starts enabled. See `transcript_log`.
+    ///
+    /// The applet toggles this at runtime without writing it back here; the
+    /// config value is only the state at startup.
+    pub log_transcripts     : bool,
 }
 
 // --- Config ---
@@ -102,6 +107,7 @@ impl Default for Config {
             fallback_partials   : FallbackPartials::WaitForFinal,
             stability_frames    : 2,
             asr_nice            : -5,
+            log_transcripts     : false,
         }
     }
 }
@@ -130,6 +136,28 @@ impl Config {
                 config
             }
         }
+    }
+
+    /// Records a new trigger key in the config file.
+    ///
+    /// Re-reads the file rather than writing the in-memory copy, so anything
+    /// the user edited since startup survives; a malformed file is left alone
+    /// for the same reason `load` leaves it alone. The write goes through a
+    /// rename so a crash mid-write cannot leave a truncated config behind.
+    pub fn persist_trigger(code: u16) -> Result<()> {
+        let path = config_path();
+        let mut config = match std::fs::read_to_string(&path) {
+            Ok(text) => ron::from_str::<Self>(&text)
+                .with_context(|| format!("{} is malformed; not overwriting it", path.display()))?,
+            Err(_)   => Self::default(),
+        };
+        config.trigger_code = code;
+
+        let tmp = path.with_extension("ron.tmp");
+        config.write_template(&tmp)?;
+        std::fs::rename(&tmp, &path).context("replacing the config file")?;
+
+        Ok(())
     }
 
     /// Writes this config as a RON template.
@@ -178,6 +206,11 @@ fn default_model_path() -> PathBuf {
 /// Returns the default streaming model directory.
 fn default_streaming_path() -> PathBuf {
     data_dir().join("models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8")
+}
+
+/// Where committed transcripts are appended when logging is on.
+pub fn transcript_log_path() -> PathBuf {
+    data_dir().join("transcripts.jsonl")
 }
 
 /// `~/.local/share/cosmic-voice`, honouring `XDG_DATA_HOME`.

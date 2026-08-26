@@ -12,18 +12,20 @@ use cosmic::{
     app,
     applet::padded_control,
     iced::{
-        self, Length, Subscription, window,
+        self, Limits, Subscription, window,
         platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
     },
-    widget::{button, row, text},
+    widget::{button, settings, text, toggler},
 };
 
 use crate::config::Config;
 use crate::engine::{self, Handle};
+use crate::hotkey::key_name;
 use crate::ipc::{Command, Event};
 
 const APP_ID: &str = "dev.techgeek1.CosmicExtAppletVoice";
-const POPUP_WIDTH: f32 = 300.0;
+const POPUP_MIN_WIDTH: f32 = 300.0;
+const POPUP_MAX_WIDTH: f32 = 372.0;
 
 /// The engine handle, global so the event subscription (a plain `fn`) can
 /// reach it. Set once in `init`.
@@ -53,6 +55,8 @@ enum EngineState {
     Failed,
     /// Trigger disarmed by the user.
     Disabled,
+    /// Waiting for the user to press the new trigger key.
+    Rebinding,
 }
 
 pub struct App {
@@ -61,12 +65,12 @@ pub struct App {
     state      : EngineState,
     /// Elapsed seconds while recording, for the popup.
     elapsed_s  : u64,
-    /// Live hypothesis while recording, shown in the popup.
-    partial    : String,
-    /// Last committed transcript.
-    last_text  : Option<String>,
     /// Last failure, cleared on the next successful cycle.
     error      : Option<String>,
+    /// Whether the engine is appending transcripts to the corpus log.
+    logging    : bool,
+    /// evdev code of the trigger key in effect.
+    trigger    : u16,
 }
 
 #[derive(Clone, Debug)]
@@ -74,9 +78,9 @@ pub enum Message {
     TogglePopup,
     PopupClosed(window::Id),
     Engine(Event),
-    Toggle,
-    Cancel,
     SetEnabled(bool),
+    SetLogging(bool),
+    Rebind,
 }
 
 impl cosmic::Application for App {
@@ -105,9 +109,9 @@ impl cosmic::Application for App {
             popup     : None,
             state     : EngineState::Starting,
             elapsed_s : 0,
-            partial   : String::new(),
-            last_text : None,
             error     : None,
+            logging   : false,
+            trigger   : 0,
         };
 
         (app, cosmic::iced::Task::none())
@@ -129,13 +133,18 @@ impl cosmic::Application for App {
                 }
                 let id = window::Id::unique();
                 self.popup.replace(id);
-                let settings = self.core.applet.get_popup_settings(
+                let mut settings = self.core.applet.get_popup_settings(
                     self.core.main_window_id().unwrap(),
                     id,
                     None,
                     None,
                     None,
                 );
+                settings.positioner.size_limits = Limits::NONE
+                    .min_width(POPUP_MIN_WIDTH)
+                    .max_width(POPUP_MAX_WIDTH)
+                    .min_height(1.0)
+                    .max_height(1080.0);
                 return get_popup(settings);
             }
             Message::PopupClosed(id) => {
@@ -144,20 +153,20 @@ impl cosmic::Application for App {
                 }
             }
             Message::Engine(event) => self.apply(event),
-            Message::Toggle => {
-                if let Some(handle) = ENGINE.get() {
-                    let _ = handle.commands.try_send(Command::Toggle);
-                }
-            }
-            Message::Cancel => {
-                if let Some(handle) = ENGINE.get() {
-                    let _ = handle.commands.try_send(Command::Cancel);
-                }
-            }
             Message::SetEnabled(enabled) => {
                 if let Some(handle) = ENGINE.get() {
                     let cmd = if enabled { Command::Enable } else { Command::Disable };
                     let _ = handle.commands.try_send(cmd);
+                }
+            }
+            Message::SetLogging(enabled) => {
+                if let Some(handle) = ENGINE.get() {
+                    let _ = handle.commands.try_send(Command::SetLogging(enabled));
+                }
+            }
+            Message::Rebind => {
+                if let Some(handle) = ENGINE.get() {
+                    let _ = handle.commands.try_send(Command::Rebind);
                 }
             }
         }
@@ -173,6 +182,7 @@ impl cosmic::Application for App {
             EngineState::Transcribing => "emblem-synchronizing-symbolic",
             EngineState::Failed       => "dialog-error-symbolic",
             EngineState::Disabled     => "microphone-disabled-symbolic",
+            EngineState::Rebinding    => "input-keyboard-symbolic",
         };
 
         self.core
@@ -185,45 +195,41 @@ impl cosmic::Application for App {
     fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
         let status = match self.state {
             EngineState::Starting     => "Loading models…".to_owned(),
-            EngineState::Idle         => "Ready — hold F13 to talk".to_owned(),
+            EngineState::Idle         => format!("Ready — hold {} to talk", key_name(self.trigger)),
             EngineState::Recording    => format!("Recording… {}s", self.elapsed_s),
             EngineState::Transcribing => "Transcribing…".to_owned(),
             EngineState::Failed       => "Failed".to_owned(),
             EngineState::Disabled     => "Disabled — trigger inactive".to_owned(),
+            EngineState::Rebinding    => "Press the new trigger key (Esc cancels)".to_owned(),
         };
 
-        let mut content = cosmic::widget::column::with_capacity(4)
+        let enabled = self.state != EngineState::Disabled;
+        let rebind = if self.state == EngineState::Rebinding {
+            button::standard("Press a key…")
+        } else {
+            button::standard(key_name(self.trigger)).on_press(Message::Rebind)
+        };
+        let controls = settings::section()
+            .add(settings::item(
+                "Dictation",
+                toggler(enabled).on_toggle(Message::SetEnabled),
+            ))
+            .add(settings::item(
+                "Log transcripts",
+                toggler(self.logging).on_toggle(Message::SetLogging),
+            ))
+            .add(settings::item("Trigger key", rebind));
+
+        let mut content = cosmic::widget::column::with_capacity(3)
+            .padding([8, 0])
             .spacing(8)
             .push(padded_control(text::heading(status)));
-
-        if self.state == EngineState::Recording && !self.partial.is_empty() {
-            content = content.push(padded_control(text::body(self.partial.clone())));
-        }
         if let Some(error) = &self.error {
             content = content.push(padded_control(text::body(error.clone())));
         }
-        if let Some(last) = &self.last_text {
-            content = content.push(padded_control(text::caption(last.clone())));
-        }
-
-        let controls = if self.state == EngineState::Disabled {
-            row::with_capacity(1)
-                .spacing(8)
-                .push(button::standard("Enable").on_press(Message::SetEnabled(true)))
-        } else {
-            let toggle_label = if self.state == EngineState::Recording { "Stop" } else { "Start" };
-            row::with_capacity(3)
-                .spacing(8)
-                .push(button::standard(toggle_label).on_press(Message::Toggle))
-                .push(button::standard("Cancel").on_press(Message::Cancel))
-                .push(button::standard("Disable").on_press(Message::SetEnabled(false)))
-        };
         content = content.push(padded_control(controls));
 
-        self.core
-            .applet
-            .popup_container(content.width(Length::Fixed(POPUP_WIDTH)))
-            .into()
+        self.core.applet.popup_container(content).into()
     }
 }
 
@@ -235,7 +241,6 @@ impl App {
                 if self.state != EngineState::Failed {
                     self.state = EngineState::Idle;
                 }
-                self.partial.clear();
             }
             Event::Recording { elapsed_ms } => {
                 self.state = EngineState::Recording;
@@ -245,14 +250,10 @@ impl App {
             Event::Transcribing => {
                 self.state = EngineState::Transcribing;
             }
-            Event::Partial { text } => {
-                self.partial = text;
-            }
-            Event::Injected { text } => {
+            Event::Partial { .. } => {}
+            Event::Injected { .. } => {
                 self.state = EngineState::Idle;
                 self.error = None;
-                self.last_text = Some(text);
-                self.partial.clear();
             }
             Event::Failed { reason } => {
                 self.state = EngineState::Failed;
@@ -260,7 +261,16 @@ impl App {
             }
             Event::Disabled => {
                 self.state = EngineState::Disabled;
-                self.partial.clear();
+            }
+            Event::Logging { enabled } => {
+                self.logging = enabled;
+            }
+            Event::Rebinding => {
+                self.state = EngineState::Rebinding;
+                self.error = None;
+            }
+            Event::Trigger { code } => {
+                self.trigger = code;
             }
         }
     }

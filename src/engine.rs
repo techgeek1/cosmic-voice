@@ -18,9 +18,10 @@ use tokio::sync::{broadcast, mpsc};
 use crate::asr::{AsrCmd, AsrEvent};
 use crate::audio::Capture;
 use crate::config::{Config, FallbackPartials};
-use crate::hotkey::{KeyEdge, Watcher};
+use crate::hotkey::{HotkeyEvent, KeyEdge, Watcher};
 use crate::inject::{Injector, common_prefix_len};
 use crate::ipc::{Command, Event};
+use crate::transcript_log;
 use crate::vad::SilenceGate;
 
 /// How often captured audio is drained to the recogniser while recording.
@@ -175,6 +176,13 @@ struct Engine {
     /// and start commands; everything else keeps running so re-arming is
     /// instant.
     enabled    : bool,
+    /// Whether committed transcripts are appended to the corpus log.
+    logging    : bool,
+    /// Whether a rebind is waiting for a key press. Key edges do not arrive
+    /// while this is set; commands that would start capture are ignored.
+    rebinding  : bool,
+    /// Control over the hotkey watcher thread, once it is running.
+    hotkey     : Option<crate::hotkey::Control>,
     /// Continuously running microphone capture.
     capture    : Capture,
     /// Commands into the recogniser thread.
@@ -202,6 +210,10 @@ struct Engine {
     hyps       : VecDeque<String>,
     /// Text already typed via the virtual keyboard this utterance.
     vk_typed   : String,
+    /// The streaming model's latest hypothesis this utterance, for the log.
+    last_hyp   : String,
+    /// Samples handed to the offline model, for the log.
+    utt_len    : usize,
 }
 
 impl Engine {
@@ -215,23 +227,34 @@ impl Engine {
         tracing::info!("injector ready, input method: {}", inject.im_status());
         let (asr, asr_events) = crate::asr::spawn(&config);
 
+        let snapshot = crate::ipc::Snapshot {
+            state   : None,
+            logging : config.log_transcripts,
+            trigger : config.trigger_code,
+        };
+
         Ok(Self {
             vad        : SilenceGate::new(config.silence_ms),
             state      : State::Idle,
             enabled    : true,
+            logging    : config.log_transcripts,
+            rebinding  : false,
+            hotkey     : None,
             utt_start  : 0,
             cursor     : 0,
             started    : Instant::now(),
             last_sec   : 0,
             hyps       : VecDeque::new(),
             vk_typed   : String::new(),
+            last_hyp   : String::new(),
+            utt_len    : 0,
             config     : config,
             capture    : capture,
             asr        : asr,
             asr_events : asr_events,
             inject     : inject,
             events     : events,
-            latest     : crate::ipc::Latest::default(),
+            latest     : std::sync::Arc::new(std::sync::Mutex::new(snapshot)),
         })
     }
 
@@ -239,12 +262,13 @@ impl Engine {
     async fn run(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<()> {
         // The physical trigger, on its own thread because udev's socket is not
         // Send. A dead watcher leaves the socket-command path alive.
-        let (key_tx, mut keys) = mpsc::channel::<KeyEdge>(16);
-        let trigger = self.config.trigger_code;
+        let (key_tx, mut keys) = mpsc::channel::<HotkeyEvent>(16);
+        let (mut watcher, control) =
+            Watcher::new(self.config.trigger_code).context("creating the hotkey watcher")?;
+        self.hotkey = Some(control);
         std::thread::Builder::new()
             .name("hotkey".into())
             .spawn(move || {
-                let mut watcher = Watcher::new(trigger);
                 if let Err(e) = watcher.run_blocking(key_tx) {
                     tracing::error!("hotkey watcher stopped: {e:#}");
                 }
@@ -266,9 +290,10 @@ impl Engine {
 
         loop {
             tokio::select! {
-                edge = keys.recv() => match edge {
-                    Some(edge) => self.on_key(edge),
-                    None       => tracing::warn!("hotkey channel closed"),
+                evt = keys.recv() => match evt {
+                    Some(HotkeyEvent::Edge(edge))   => self.on_key(edge),
+                    Some(HotkeyEvent::Rebound(code)) => self.on_rebound(code),
+                    None => tracing::warn!("hotkey channel closed"),
                 },
                 cmd = commands.recv() => match cmd {
                     Some(cmd) => self.on_command(cmd),
@@ -311,7 +336,9 @@ impl Engine {
         match cmd {
             Command::Enable        => return self.set_enabled(true),
             Command::Disable       => return self.set_enabled(false),
-            _ if !self.enabled     => return,
+            Command::SetLogging(on) => return self.set_logging(on),
+            Command::Rebind        => return self.start_rebind(),
+            _ if !self.enabled || self.rebinding => return,
             _                      => {}
         }
         match (cmd, self.state) {
@@ -347,6 +374,51 @@ impl Engine {
         self.emit(Event::Disabled);
     }
 
+    /// Puts the watcher into capture mode for the next key press.
+    ///
+    /// Anything in flight is cancelled first: the key the user is about to
+    /// press is a choice, not dictation, and the watcher stops reporting edges
+    /// while it captures, so a held utterance could never be released anyway.
+    fn start_rebind(&mut self) {
+        let Some(control) = self.hotkey.clone() else {
+            tracing::warn!("rebind requested before the hotkey watcher started");
+            return;
+        };
+        if self.rebinding {
+            return;
+        }
+        if self.state != State::Idle {
+            self.cancel();
+        }
+        self.rebinding = true;
+        control.capture();
+        self.emit(Event::Rebinding);
+    }
+
+    /// Handles the watcher's answer to a rebind.
+    fn on_rebound(&mut self, code: Option<u16>) {
+        self.rebinding = false;
+        if let Some(code) = code {
+            self.config.trigger_code = code;
+            if let Err(e) = Config::persist_trigger(code) {
+                tracing::warn!("could not save the trigger: {e:#}");
+                self.emit(Event::Failed { reason: format!("trigger not saved: {e:#}") });
+            }
+        }
+        self.emit(Event::Trigger { code: self.config.trigger_code });
+        self.emit(if self.enabled { Event::Idle } else { Event::Disabled });
+    }
+
+    /// Switches transcript logging.
+    fn set_logging(&mut self, enabled: bool) {
+        if self.logging == enabled {
+            return;
+        }
+        self.logging = enabled;
+        tracing::info!("transcript logging {}", if enabled { "on" } else { "off" });
+        self.emit(Event::Logging { enabled: enabled });
+    }
+
     /// Begins capture at `now - preroll`.
     fn start_recording(&mut self, held: bool) {
         self.utt_start = self.capture.mark_preroll();
@@ -356,6 +428,7 @@ impl Engine {
         self.vad.reset();
         self.hyps.clear();
         self.vk_typed.clear();
+        self.last_hyp.clear();
         let _ = self.asr.send(AsrCmd::Reset);
 
         self.state = State::Recording { held: held };
@@ -396,6 +469,7 @@ impl Engine {
     fn finish_recording(&mut self) {
         let samples = self.capture.read(self.utt_start, self.capture.now());
         let hotwords = self.config.default_hotwords.clone();
+        self.utt_len = samples.len();
         let _ = self.asr.send(AsrCmd::Finalize { samples: samples, hotwords: hotwords });
 
         self.state = State::Transcribing;
@@ -417,6 +491,8 @@ impl Engine {
         match evt {
             AsrEvent::Ready => {
                 tracing::info!("models loaded");
+                self.emit(Event::Logging { enabled: self.logging });
+                self.emit(Event::Trigger { code: self.config.trigger_code });
                 self.emit(if self.enabled { Event::Idle } else { Event::Disabled });
             }
             AsrEvent::LoadFailed(reason) => {
@@ -427,6 +503,7 @@ impl Engine {
                 if matches!(self.state, State::Recording { .. }) {
                     self.emit(Event::Partial { text: text.clone() });
                     self.show_partial(&text);
+                    self.last_hyp = text;
                 }
             }
             AsrEvent::Final(Ok(text)) => {
@@ -538,14 +615,31 @@ impl Engine {
         }
         self.state = State::Idle;
         self.emit(Event::Idle);
+
+        // Logged regardless of whether injection succeeded: the transcript is
+        // the data, and a focus-related injection failure says nothing about it.
+        if self.logging {
+            let record = transcript_log::Record {
+                ts       : transcript_log::now(),
+                audio_ms : self.utt_len as u64 * 1000 / crate::audio::SAMPLE_RATE as u64,
+                partial  : &self.last_hyp,
+                text     : text,
+            };
+            if let Err(e) = transcript_log::append(&crate::config::transcript_log_path(), &record) {
+                tracing::warn!("transcript log: {e:#}");
+            }
+        }
     }
 
     /// Publishes an event, ignoring the no-subscriber case.
     fn emit(&self, event: Event) {
         // Partials churn too fast to be a useful snapshot and are meaningless
         // outside a recording; everything else is state a late mirror needs.
-        if !matches!(event, Event::Partial { .. }) {
-            *self.latest.lock().unwrap() = Some(event.clone());
+        match &event {
+            Event::Partial { .. }       => {}
+            Event::Logging { enabled }  => self.latest.lock().unwrap().logging = *enabled,
+            Event::Trigger { code }     => self.latest.lock().unwrap().trigger = *code,
+            _ => self.latest.lock().unwrap().state = Some(event.clone()),
         }
         let _ = self.events.send(event);
     }

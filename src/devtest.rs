@@ -18,6 +18,7 @@ pub fn run(args: &[String]) -> Result<()> {
         [c, model, wav] if c == "stream" => stream(Path::new(model), wav),
         [c, secs] if c == "capture"      => capture(secs.parse()?),
         [c] if c == "keys"               => keys(),
+        [c] if c == "rebind"             => rebind(),
         [c] if c == "engine"             => engine(),
         [c] if c == "inject-probe"       => inject_probe(false),
         // DANGER: binds the seat's input-method slot. With IBus's Wayland IM
@@ -26,7 +27,7 @@ pub fn run(args: &[String]) -> Result<()> {
         [c] if c == "inject-probe-im"    => inject_probe(true),
         _ => Err(anyhow!(
             "checks: decode <model_dir> <wav> | stream <model_dir> <wav> | \
-             capture <secs> | keys | inject-probe"
+             capture <secs> | keys | rebind | inject-probe"
         )),
     }
 }
@@ -108,8 +109,8 @@ fn keys() -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (mut watcher, _control) = crate::hotkey::Watcher::new(183)?;
         std::thread::spawn(move || {
-            let mut watcher = crate::hotkey::Watcher::new(183);
             if let Err(e) = watcher.run_blocking(tx) {
                 eprintln!("watcher: {e:#}");
             }
@@ -122,6 +123,42 @@ fn keys() -> Result<()> {
                 Ok(Some(edge)) => println!("{edge:?}"),
                 Ok(None)       => break,
                 Err(_)         => break,
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Exercises the rebind path: opens every keyboard unmasked and reports the
+/// first key pressed, or the timeout if none is.
+fn rebind() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (mut watcher, control) = crate::hotkey::Watcher::new(183)?;
+        std::thread::spawn(move || {
+            if let Err(e) = watcher.run_blocking(tx) {
+                eprintln!("watcher: {e:#}");
+            }
+        });
+
+        control.capture();
+        println!(
+            "press a key within {}s (Esc cancels)…",
+            crate::hotkey::CAPTURE_WINDOW.as_secs()
+        );
+        loop {
+            match rx.recv().await {
+                Some(crate::hotkey::HotkeyEvent::Rebound(Some(code))) => {
+                    println!("captured {code} ({})", crate::hotkey::key_name(code));
+                    break;
+                }
+                Some(crate::hotkey::HotkeyEvent::Rebound(None)) => {
+                    println!("no key captured");
+                    break;
+                }
+                Some(other) => println!("{other:?}"),
+                None        => break,
             }
         }
         Ok(())

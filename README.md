@@ -39,8 +39,8 @@ machine.
 
 ## Setup
 
-Map a key to F13 on your keyboard (e.g. via VIA/Keychron Launcher), fetch both
-models with `just models` (~1.3GB into `~/.local/share/cosmic-voice`), then
+Map a key to F13 on your keyboard (e.g. via VIA/Keychron Launcher) or rebind
+the trigger from the popup once it is running, fetch both models with `just models` (~1.3GB into `~/.local/share/cosmic-voice`), then
 `sudo just install` and add **Voice** to the panel through COSMIC's applet
 settings. No XKB changes are needed: evdev sits below the keymap, so it does
 not matter that the default `us` layout maps keycode 183 to `XF86Tools`.
@@ -48,6 +48,17 @@ not matter that the default `us` layout maps keycode 183 to `XF86Tools`.
 Settings live in `~/.config/cosmic-voice/config.ron`, written with commented
 defaults on first run. `cosmic-voice enable|disable|start|stop|toggle|cancel`
 controls a running instance from scripts or extra keybindings.
+
+The popup has two switches and a key. **Dictation** arms or disarms the
+trigger. **Log transcripts** appends every committed utterance as a JSON line
+to `~/.local/share/cosmic-voice/transcripts.jsonl`, raw from the recogniser,
+as a corpus for evaluating a cleanup pass; logging starts off unless
+`log_transcripts: true` is set in the config, and `cosmic-voice log on|off`
+switches it from scripts. **Trigger key** shows the current binding; press it
+and then the key you want (Esc cancels, ten seconds and it gives up), and the
+choice takes effect immediately and is written back to the config. During
+that window, and only then, the watcher reads every keyboard unmasked;
+`cosmic-voice rebind` starts it from scripts.
 
 The panel spawns one applet process per output; the instances elect a single
 primary that owns the microphone, the hotkey, and the resident models, and the
@@ -65,4 +76,5 @@ rest mirror it, so every panel icon works and nothing runs multiplied.
 | `toplevel.rs`  | focused app_id for prompt selection               |
 | `engine.rs`    | state machine wiring the above together           |
 | `ipc.rs`       | the applet/engine boundary                        |
+| `transcript_log.rs` | raw transcript corpus, one JSON line per utterance |
 | `app.rs`       | panel applet, icon and settings popup             |
