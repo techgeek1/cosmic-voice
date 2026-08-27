@@ -304,7 +304,7 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
 
 ## Build strategy (banked 2026-08-25)
 
-Status: **phases 1 to 5 done (2026-08-27), cutover pending** — `src/ibus/`,
+Status: **phases 1 to 5 done, cutover done (2026-08-27, findings 10 and 11), phase 6 in progress** — `src/ibus/`,
 `src/im/`, `src/sink.rs` and the `input_method` config mode. See the findings
 sections below for what implementing them corrected in this document. All five
 are code-complete, unit-tested and green in the nested harness, and none has
@@ -988,7 +988,8 @@ corrections.
     and the property menu are only reachable by *being* the daemon's panel
     service (`org.freedesktop.IBus.Panel`: `RegisterProperties`,
     `UpdateProperty`, `PropertyActivate`), which the phase-4 panel connection
-    deliberately is not. Open decision, see the end of this document.
+    deliberately is not. Decided 2026-08-27: replaced in the applet, without
+    a panel service — see "Phase 6" at the end of this document.
 
 ### What was verified, and how
 
@@ -1016,3 +1017,103 @@ keyboard dies. It deliberately stops and starts nothing: the instant the slot
 changes hands is the one worth watching. `scripts/rollback.sh` reverses it, in
 the reverse order, which matters — the multiplexer has to let go before IBus's
 bridge takes hold.
+
+## Phase 6: the panel presence, in the applet (planned 2026-08-27)
+
+Phase-5 finding 11 ends with what `ibus-ui-gtk3` did that nothing replaced:
+the tray indicator with the engine, mozc's input mode, and a menu for both.
+Decision: it comes back inside the applet we already have on the panel, and
+**not** by owning `org.freedesktop.IBus.Panel`. The user's words: never liked
+the panel anyway.
+
+### Principle
+
+Properties are per-context, and the daemon routes them by *capability*, not by
+who the panel is. With `IBUS_CAP_PROPERTY` in `SetCapabilities`, the engine's
+`RegisterProperties` and `UpdateProperty` are emitted as D-Bus signals on our
+input context (`bus/inputcontext.c:2544-2551`, `:2573-2580`), and
+`PropertyActivate(s key, u state)` is a method of the context
+(`bus/inputcontext.c:1375-1387`, dispatched straight to the context's engine).
+Without the capability the same calls go to the panel service, which is the
+only reason `ibus-ui-gtk3` ever saw them. So the whole panel role that is
+left — the mode glyph and the menu — is one capability bit on the connection
+we already hold, plus a codec and some UI.
+
+The glyph rule is `ibus-ui-gtk3`'s (`ui/gtk3/panel.vala:1790-1795`): the
+property whose `key` equals the engine's `icon_prop_key` (an `EngineDesc`
+field; mozc's is `InputMode`) supplies the indicator through its `symbol`
+text, updated by `UpdateProperty` as the mode changes. Everything else in the
+list is the menu. mozc re-registers on every FocusIn
+(`unix/ibus/property_handler.cc`, `Register`), and xkb engines register
+nothing, so the cache is cleared on `GlobalEngineChanged` and refilled by the
+next `RegisterProperties` — an engine with no properties has an empty menu,
+not a stale one.
+
+### Wire format
+
+`IBusProperty` serialises (`src/ibusproperty.c:362-401`) as
+`(sa{sv} s u v s v b b u v v)`: the serializable header, then `key`,
+`type`, `label` (variant holding `IBusText`), `icon`, `tooltip` (`IBusText`),
+`sensitive`, `visible`, `state`, `sub_props` (variant holding `IBusPropList`),
+and — after `sub_props`, "keep the serialized order for the compatibility" —
+`symbol` (`IBusText`). `IBusPropList` is `(sa{sv} av)` of property variants.
+Types: NORMAL 0, TOGGLE 1, RADIO 2, MENU 3, SEPARATOR 4; states: UNCHECKED 0,
+CHECKED 1, INCONSISTENT 2 (`src/ibusproperty.h`). Verify against the source,
+not this paragraph, and prove it with a round trip.
+
+### Deliverables
+
+1. `src/ibus/text.rs`: `Property` and `PropList` on the `Serializable`
+   trait, with unit tests: a round trip, and a hand-built mozc-shaped list
+   (an `InputMode` MENU with RADIO children, one CHECKED, and a `Tool` MENU
+   of NORMAL items). Expose `EngineDesc::icon_prop_key` if the codec does not
+   already (check the field order in `src/ibusenginedesc.c`).
+2. `src/ibus/context.rs`: `CAP_PROPERTY` joins `CAPABILITIES` (and the doc
+   comment that says why it was left out is rewritten to say why it is in);
+   `ContextSignal::RegisterProperties(PropList)` and
+   `UpdateProperty(Property)`; `Context::property_activate(key, state)`.
+   `devtest ibus-keys` prints properties as they arrive — safe on the live
+   daemon and the fastest way to see what mozc actually sends.
+3. `src/im/properties.rs`, pure: the property model — `register(list)`,
+   `update(prop)` (by key, recursing into `sub_props`), `clear()`,
+   `indicator(icon_prop_key) -> Option<String>`, and a `menu()` view. Unit
+   tests in the shape of `im::dictation`'s. The frontend owns one, feeds it
+   from the link's signals, clears it on `GlobalEngineChanged`, and publishes
+   a snapshot through `ImEvent` whenever it changes.
+4. `src/ipc.rs`: everything the applet renders is in `Snapshot`, serde
+   types only, no `ibus` types. `InputMethodState::Running` gains the
+   engine cycle (described: name, longname, symbol), the indicator, and the
+   menu (`ImProperty { key, label, kind, state, sensitive, visible, symbol,
+   children }`). Two new commands, `SetEngine(String)` and
+   `ActivateProperty { key, state }`, with CLI verbs (`cosmic-voice engine
+   <name>` at least) so the harness and scripts can drive them.
+5. The engine-to-frontend path: today `DictationLink` carries
+   `DictationCmd` into the running frontend's calloop loop. The two new
+   commands need the same road. Generalise the link rather than adding a
+   second one, but leave `im::dictation::advance` and its tests untouched:
+   the turn-taking decision is not what is changing. `SetEngine` goes to the
+   switcher (`set_global_engine`, confirmation via `GlobalEngineChanged` as
+   always); `ActivateProperty` goes to the context.
+6. `src/app.rs`: the panel button shows the mic icon and, when the
+   multiplexer is running with an indicator, the glyph beside it; the ready
+   line prefers the live indicator over the engine's static symbol. The popup
+   gains an "Input method" section: one row per engine in the cycle with the
+   current one marked (press to switch), then the menu — a MENU of RADIO
+   children as a titled group of selectable rows, a TOGGLE as a toggler, a
+   NORMAL as a button, SEPARATOR as spacing; `visible: false` hidden,
+   `sensitive: false` disabled; `label` text, key as fallback. Nothing in the
+   popup may block: commands go through the engine handle as the existing
+   ones do.
+7. `scripts/im-harness/property-test.sh`, against the scratch daemon with
+   `mozc-on`: properties registered with an `InputMode` menu; indicator is
+   mozc's hiragana glyph; `ActivateProperty InputMode.Direct` → an
+   `UpdateProperty` changes the indicator and `konnnitiha` then arrives as
+   ASCII; `InputMode.Hiragana` converts again; `SetEngine xkb:us::eng` clears
+   the menu and the indicator; back to `mozc-on` re-registers. Drive it
+   through the fifo `devtest im-frontend` already reads for dictation,
+   generalised to a control fifo (rename the flag or alias it; the four
+   existing suites stay green either way).
+8. `docs/multiplexer.md` "Findings from phase 6", README (the cutover
+   section says what the popup now shows and that the tray icon is gone on
+   purpose), and the usual: `cargo test`, `cargo build` before any harness
+   run, all five suites, nothing bound on the live display.
