@@ -49,7 +49,9 @@ pub use context::{
     PREEDIT_COMMIT, PostRecord, RELEASE_MASK, SHIFT_MASK, SUPER_MASK, SignalStream,
     describe_capabilities, describe_state,
 };
-pub use text::Text;
+pub use text::{
+    LookupTable, ORIENTATION_HORIZONTAL, ORIENTATION_SYSTEM, ORIENTATION_VERTICAL, Text,
+};
 
 use std::path::PathBuf;
 use std::time::Duration;

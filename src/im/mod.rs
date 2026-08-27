@@ -25,13 +25,15 @@
 //!   reach the loop.
 //! - [`content_type`] — text-input-v3's idea of what a field is, translated to
 //!   IBus's.
+//! - [`popup`] — the candidate window: the input-popup surface, the shm
+//!   buffers, and the lookup-table state behind them.
+//! - [`render`] — turning that state into pixels, with no Wayland in sight.
+//! - [`theme`] — where the candidate window's colours come from.
 //!
 //! # Not here yet
 //!
-//! Candidate rendering (phase 3), the panel duties that make Super+Space switch
-//! engines (phase 4), and dictation turn-taking (phase 5). With this phase
-//! alone, typing through mozc works but the candidate window is invisible, so
-//! it is a milestone rather than something to switch to as a daily driver.
+//! The panel duties that make Super+Space switch engines (phase 4) and
+//! dictation turn-taking (phase 5).
 //!
 //! # Safety
 //!
@@ -49,6 +51,9 @@ mod content_type;
 mod frontend;
 mod keyboard;
 mod link;
+mod popup;
+mod render;
 mod router;
+mod theme;
 
 pub use frontend::{Options, run};

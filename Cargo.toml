@@ -90,6 +90,22 @@ calloop-wayland-source = "0.4"
 # timer the same executor understands, and `tokio::time` is not it any more.
 async-io = "2"
 
+# The candidate window (`src/im/popup.rs`, `src/im/render.rs`). A
+# `zwp_input_popup_surface_v2` is a bare `wl_surface`: no toolkit can target it,
+# so the pixels are ours to produce, and both crates are picked to unify with
+# what libcosmic already drags in rather than to add a second copy of a
+# rasteriser.
+#
+# `tiny-skia` pinned to 0.11 on purpose: 0.12 exists but `iced_tiny_skia` is on
+# 0.11.4, and taking 0.12 would compile two of it.
+#
+# `cosmic-text` because CJK is the entire point. Candidates are Japanese, so the
+# renderer needs real shaping and a font fallback chain, not a bitmap blit —
+# and cosmic-text is already in the graph via libcosmic's iced, so this costs
+# nothing new to build.
+tiny-skia   = "0.11"
+cosmic-text = "0.19"
+
 # Focused-window app_id, used to pick a per-application vocabulary prompt.
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
 

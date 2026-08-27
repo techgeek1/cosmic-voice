@@ -40,7 +40,7 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
-use wayland_client::protocol::{wl_keyboard, wl_registry, wl_seat};
+use wayland_client::protocol::{wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_keyboard_grab_v2::{self, ZwpInputMethodKeyboardGrabV2},
@@ -55,6 +55,7 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 use super::content_type::ContentType;
 use super::keyboard::{Keyboard, RepeatInfo, XKB_KEYCODE_OFFSET};
 use super::link::{Link, Upstream};
+use super::popup::Popup;
 use super::router::{self, KeyFacts, Route};
 use crate::ibus::{ContextSignal, PREEDIT_COMMIT, PostRecord, RELEASE_MASK, Text, describe_state};
 
@@ -180,6 +181,10 @@ pub struct Frontend {
 
     /// Grab and virtual keyboard, while a field has focus.
     session     : Option<Session>,
+    /// The candidate window. Its surface outlives every activation; see
+    /// [`super::popup`] for why. `None` only if it could not be created, in
+    /// which case everything else still works and mozc converts blind.
+    popup       : Option<Popup>,
     /// Keymap and modifier state.
     keyboard    : Keyboard,
     /// The preedit we are holding, if any.
@@ -266,11 +271,27 @@ pub fn run(options: Options) -> Result<()> {
     let vk_manager: ZwpVirtualKeyboardManagerV1 = globals
         .bind(&qh, 1..=1, ())
         .context("binding zwp_virtual_keyboard_manager_v1")?;
+    // For the candidate window: a surface to give the popup role to, and the
+    // shared memory its pixels live in. Both are core globals every compositor
+    // has, so failing to bind either means something is very wrong.
+    let compositor: wl_compositor::WlCompositor = globals
+        .bind(&qh, 1..=6, ())
+        .context("binding wl_compositor")?;
+    let shm: wl_shm::WlShm = globals
+        .bind(&qh, 1..=1, ())
+        .context("binding wl_shm")?;
     // `im_manager` stays a live local for the whole of `run`: the manager is
     // not needed again, but a bound global that goes out of scope is one more
     // thing to reason about on a connection whose lifetime is the process's.
     let im = im_manager.get_input_method(&seat, &qh, ());
     tracing::info!("input method bound on {}", options.display);
+
+    // Created here rather than per activation: smithay re-parents an existing
+    // popup on every `activate`, and only delivers the caret rectangle to a
+    // popup that already exists. See [`super::popup`].
+    let popup = Popup::new(&compositor, &shm, &im, &qh)
+        .map_err(|e| tracing::error!("no candidate window ({e:#}); conversion will be blind"))
+        .ok();
 
     let mut event_loop: EventLoop<'static, Frontend> =
         EventLoop::try_new().context("creating the event loop")?;
@@ -289,6 +310,7 @@ pub fn run(options: Options) -> Result<()> {
         change_cause: 0,
         content     : ContentType::default(),
         session     : None,
+        popup       : popup,
         keyboard    : Keyboard::new(),
         preedit     : None,
         wants_around: false,
@@ -318,8 +340,16 @@ pub fn run(options: Options) -> Result<()> {
         })
         .map_err(|e| anyhow!("registering the tick timer: {e}"))?;
 
+    // The closure runs after every dispatch, which is where the candidate
+    // window draws: one keystroke through mozc produces a burst of signals and
+    // this is the point at which all of them have been applied. See
+    // [`Popup::flush`].
     event_loop
-        .run(None, &mut frontend, |_| {})
+        .run(None, &mut frontend, |frontend| {
+            if let Some(popup) = frontend.popup.as_mut() {
+                popup.flush();
+            }
+        })
         .context("running the event loop")?;
 
     Ok(())
@@ -379,6 +409,15 @@ fn ibus_wayland_bridge() -> Option<u32> {
 // --- Activation lifecycle ---
 
 impl Frontend {
+    /// The candidate window, for the dispatch handlers that live beside it.
+    ///
+    /// `None` when the popup could not be created at all, which is a state the
+    /// rest of the frontend is designed to survive: keys still route, mozc
+    /// still converts, the user just cannot see the candidates.
+    pub(super) fn popup(&mut self) -> Option<&mut Popup> {
+        self.popup.as_mut()
+    }
+
     /// Applies the pending state. Called once per `done`.
     fn on_done(&mut self) {
         self.serial = self.serial.wrapping_add(1);
@@ -426,6 +465,9 @@ impl Frontend {
             vkbd      : vkbd,
             has_keymap: false,
         });
+        if let Some(popup) = self.popup.as_mut() {
+            popup.set_active(true);
+        }
 
         self.attach_context();
     }
@@ -435,6 +477,9 @@ impl Frontend {
         tracing::info!("deactivate (serial {})", self.serial);
 
         self.cancel_repeat();
+        if let Some(popup) = self.popup.as_mut() {
+            popup.set_active(false);
+        }
         // A no-op on this path by design, because by now there is no field to
         // commit into and the compositor would give the text to the next one.
         // Called anyway so the rule lives in one place: see the method.
@@ -707,10 +752,14 @@ impl Frontend {
                 self.wants_around = true;
                 self.push_surrounding();
             }
-            // Everything else is candidates, auxiliary text and engine
-            // properties: received so the daemon keeps sending them and so the
-            // stream never backs up, rendered in phase 3.
-            _ => {}
+            // Candidates, auxiliary text and engine properties. The candidate
+            // window takes what it recognises and drops the rest; engine
+            // properties are phase 4's.
+            other => {
+                if let Some(popup) = self.popup.as_mut() {
+                    popup.on_signal(other);
+                }
+            }
         }
     }
 

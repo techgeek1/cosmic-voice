@@ -41,6 +41,15 @@ IBUS_LOG="$IBUS_ROOT/ibus.log"
 scratch_env() {
     # Deliberately no WAYLAND_DISPLAY and no DISPLAY: nothing started here
     # should be able to reach a compositor at all.
+    #
+    # Which is why MOZC_IBUS_CANDIDATE_WINDOW is set. mozc picks its candidate
+    # window at engine startup: with WAYLAND_DISPLAY unset it decides it is on
+    # X11 and drives its own `mozc_renderer`, emitting no lookup tables at all
+    # — so a harness with no compositor in the engine's environment silently
+    # tests the wrong routing. On the live session WAYLAND_DISPLAY *is* set and
+    # COSMIC is not in `compatible_wayland_desktop_names` (["GNOME"]), so
+    # candidates go down the IBus lookup-table path. This variable forces that
+    # same path without handing the engine a compositor to reach.
     printf '%s\n' \
         "HOME=$IBUS_HOME" \
         "USER=${USER:-$(id -un)}" \
@@ -54,6 +63,7 @@ scratch_env() {
         "XDG_DATA_DIRS=/usr/local/share:/usr/share" \
         "XDG_CONFIG_DIRS=/etc/xdg" \
         "XDG_CURRENT_DESKTOP=COSMIC" \
+        "MOZC_IBUS_CANDIDATE_WINDOW=ibus" \
         "DBUS_SESSION_BUS_ADDRESS=unix:path=$IBUS_BUS_SOCKET"
 }
 
