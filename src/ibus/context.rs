@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 
 use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
 
-use super::text::{EngineDesc, LookupTable, Serializable, Text};
+use super::text::{EngineDesc, LookupTable, PropList, Property, Serializable, Text};
 use super::{Error, Result, Signals};
 
 // --- Capability bits (ibustypes.h:119-127) ---
@@ -89,9 +89,18 @@ pub const CAP_SYNC_PROCESS_KEY: u32 = 1 << 7;
 /// difference is the point: `LOOKUP_TABLE` and `AUXILIARY_TEXT` route
 /// candidates to *us* rather than to a panel process
 /// (`bus/inputcontext.c:2334-2341`), and there is no panel process any more.
-/// `PROPERTY` is left out because nothing renders a status menu yet.
-pub const CAPABILITIES: u32 =
-    CAP_PREEDIT_TEXT | CAP_AUXILIARY_TEXT | CAP_LOOKUP_TABLE | CAP_FOCUS | CAP_SURROUNDING_TEXT;
+/// `PROPERTY` is in for the same reason: with it, `RegisterProperties` and
+/// `UpdateProperty` are emitted as signals on this context
+/// (`bus/inputcontext.c:2544-2551`, `:2573-2580`) and `PropertyActivate` goes
+/// straight to the engine (`:1375-1387`); without it the engine's status menu
+/// goes to the panel service, and the only panel service there ever was is
+/// the one the cutover retired. The applet popup is the menu now (phase 6).
+pub const CAPABILITIES: u32 = CAP_PREEDIT_TEXT
+    | CAP_AUXILIARY_TEXT
+    | CAP_LOOKUP_TABLE
+    | CAP_FOCUS
+    | CAP_PROPERTY
+    | CAP_SURROUNDING_TEXT;
 
 // --- Modifier bits (ibustypes.h:70-99) ---
 
@@ -295,7 +304,8 @@ pub trait InputContext {
     fn set_cursor_location_relative(&self, x: i32, y: i32, w: i32, h: i32) -> zbus::Result<()>;
 
     /// Activates one of the engine's properties — the status-menu entries an
-    /// engine registers. Phase 4, when there is a menu to click.
+    /// engine registers. Dispatched to this context's engine
+    /// (`bus/inputcontext.c:1375-1387`), so it needs no focus.
     fn property_activate(&self, name: &str, state: u32) -> zbus::Result<()>;
 
     /// Feeds handwriting stroke coordinates to the engine. Bound for interface
@@ -514,10 +524,19 @@ pub enum ContextSignal {
     /// The engine wants `SetSurroundingText` called. Also absent from the
     /// introspection XML, also emitted (`bus/inputcontext.c:2693-2709`).
     RequireSurroundingText,
-    /// The engine's property list. Left undecoded; see [`super::text`].
-    RegisterProperties(OwnedValue),
-    /// One property changed. Left undecoded.
-    UpdateProperty(OwnedValue),
+    /// The engine's whole status menu, replacing whatever it registered
+    /// before. mozc sends it on every `FocusIn`; the daemon itself sends an
+    /// *empty* one on focus-out and when the engine is unset
+    /// (`bus/inputcontext.c:2037`, `:3051`), which is the only way an xkb
+    /// engine's empty menu ever arrives.
+    RegisterProperties(PropList),
+    /// One entry changed, matched by key at any depth. mozc's input-mode
+    /// switch is a burst of these: one per radio child, then the menu itself
+    /// with its new symbol (`unix/ibus/property_handler.cc`,
+    /// `UpdateCompositionModeIcon`). Boxed because a property is a tree of
+    /// strings and every other signal is a few words; the channel this
+    /// travels carries the whole enum by value.
+    UpdateProperty(Box<Property>),
 }
 
 impl std::fmt::Display for ContextSignal {
@@ -560,11 +579,9 @@ impl std::fmt::Display for ContextSignal {
             }
             ContextSignal::RequireSurroundingText => write!(f, "RequireSurroundingText"),
             ContextSignal::RegisterProperties(props) => {
-                write!(f, "RegisterProperties <{}>", props.value_signature())
+                write!(f, "RegisterProperties {props}")
             }
-            ContextSignal::UpdateProperty(prop) => {
-                write!(f, "UpdateProperty <{}>", prop.value_signature())
-            }
+            ContextSignal::UpdateProperty(prop) => write!(f, "UpdateProperty {prop}"),
         }
     }
 }
@@ -729,6 +746,18 @@ impl Context {
         let value = self.proxy.get_engine()?;
 
         EngineDesc::from_value(&value)
+    }
+
+    /// Activates one of the engine's status-menu entries.
+    ///
+    /// `state` is what the entry should become, as a `PROP_STATE_*` value.
+    /// That is not decoration: mozc acts on an input-mode radio only when the
+    /// state sent is `CHECKED` (`unix/ibus/property_handler.cc`,
+    /// `ProcessPropertyActivate`), and it ignores the state entirely for its
+    /// tool entries. The engine answers with `UpdateProperty` signals, not
+    /// with the method's reply, so success here means "delivered".
+    pub fn property_activate(&self, key: &str, state: u32) -> Result<()> {
+        Ok(self.proxy.property_activate(key, state)?)
     }
 
     /// Tells the daemon where the caret is. A formality under Wayland, but
@@ -1056,8 +1085,14 @@ fn decode_signal(member: &str, message: &zbus::message::Message) -> Result<Optio
             }
         }
         "RequireSurroundingText" => ContextSignal::RequireSurroundingText,
-        "RegisterProperties"     => ContextSignal::RegisterProperties(body.deserialize()?),
-        "UpdateProperty"         => ContextSignal::UpdateProperty(body.deserialize()?),
+        "RegisterProperties" => {
+            let props: OwnedValue = body.deserialize()?;
+            ContextSignal::RegisterProperties(PropList::from_value(&props)?)
+        }
+        "UpdateProperty" => {
+            let prop: OwnedValue = body.deserialize()?;
+            ContextSignal::UpdateProperty(Box::new(Property::from_value(&prop)?))
+        }
         other => {
             tracing::debug!("ignoring unhandled ibus context signal {other}");
             return Ok(None);
@@ -1243,7 +1278,7 @@ mod tests {
     fn describes_the_capability_set_we_ask_for() {
         assert_eq!(
             describe_capabilities(CAPABILITIES),
-            "preedit|auxiliary|lookup-table|focus|surrounding-text"
+            "preedit|auxiliary|lookup-table|focus|property|surrounding-text"
         );
     }
 }

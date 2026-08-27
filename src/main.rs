@@ -60,6 +60,37 @@ fn main() -> Result<()> {
         Some("enable") => ipc::send_blocking(Command::Enable),
         Some("disable") => ipc::send_blocking(Command::Disable),
         Some("rebind") => ipc::send_blocking(Command::Rebind),
+        Some("engine") => match args.get(1) {
+            Some(name) => ipc::send_blocking(Command::SetEngine(name.clone())),
+            None => {
+                eprintln!("usage: cosmic-voice engine <ibus-engine-id>");
+                std::process::exit(2);
+            }
+        },
+        // The state defaults to checked because that is what every entry a
+        // script would want to press needs: a radio takes effect only when
+        // sent checked, a plain action ignores it.
+        Some("property") => match (args.get(1), args.get(2).map(String::as_str)) {
+            (Some(key), state) => {
+                let state = match state {
+                    None | Some("checked") | Some("1")    => 1,
+                    Some("unchecked") | Some("0")         => 0,
+                    Some("inconsistent") | Some("2")      => 2,
+                    Some(other) => {
+                        eprintln!("cosmic-voice property: unknown state {other:?}");
+                        std::process::exit(2);
+                    }
+                };
+                ipc::send_blocking(Command::ActivateProperty {
+                    key  : key.clone(),
+                    state: state,
+                })
+            }
+            (None, _) => {
+                eprintln!("usage: cosmic-voice property <key> [checked|unchecked]");
+                std::process::exit(2);
+            }
+        },
         Some("log")    => match args.get(1).map(String::as_str) {
             Some("on")  => ipc::send_blocking(Command::SetLogging(true)),
             Some("off") => ipc::send_blocking(Command::SetLogging(false)),
@@ -70,7 +101,10 @@ fn main() -> Result<()> {
         },
         Some(other)    => {
             eprintln!("cosmic-voice: unknown command {other:?}");
-            eprintln!("usage: cosmic-voice [start|stop|toggle|cancel|enable|disable|rebind|log on|off]");
+            eprintln!(
+                "usage: cosmic-voice [start|stop|toggle|cancel|enable|disable|rebind|\
+                 log on|off|engine <id>|property <key> [state]]"
+            );
             std::process::exit(2);
         }
     }

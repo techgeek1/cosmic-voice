@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Requests that drive the engine's state machine.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Begin capturing. Idempotent while already capturing.
     Start,
@@ -36,6 +36,20 @@ pub enum Command {
     /// Take the next key pressed on any keyboard as the new trigger. Aborts
     /// anything in flight; answered by `Event::Trigger` either way.
     Rebind,
+    /// Switch IBus to the named engine, e.g. `mozc-jp`. Global, like the
+    /// hotkey: every window moves at once. Confirmed by the next
+    /// `InputMethod` event naming it, not by anything sent back here.
+    SetEngine(String),
+    /// Activate one entry of the engine's status menu, by key, with the state
+    /// it should take (`ImPropState` as a number: 0 unchecked, 1 checked).
+    /// The engine answers by updating the menu, which arrives as the next
+    /// `InputMethod` event.
+    ActivateProperty {
+        /// The property's key, e.g. `InputMode.Hiragana`.
+        key  : String,
+        /// The state to set. Radios and mozc's input modes want 1.
+        state: u32,
+    },
 }
 
 /// Engine state transitions, consumed by the applet to drive the panel icon.
@@ -90,9 +104,21 @@ pub enum InputMethodState {
     /// Configured, but the slot belongs to somebody else. The reason names
     /// them and says what to do about it.
     Blocked { reason: String },
-    /// Bound and running. `engine` is the IBus engine in effect, once the
-    /// daemon has said which one it is.
-    Running { engine: Option<ImEngine> },
+    /// Bound and running. Everything the popup's "Input method" section
+    /// draws is in here, so a mirror gets it through the snapshot like the
+    /// rest of the state.
+    Running {
+        /// The IBus engine in effect, once the daemon has said which.
+        engine   : Option<ImEngine>,
+        /// The engines the switch hotkey cycles through, in cycle order.
+        engines  : Vec<ImEngine>,
+        /// The mode glyph, e.g. `あ`: the `symbol` of the property whose key
+        /// is the engine's `icon_prop_key`, updated as the engine changes
+        /// mode. `None` for an engine with no such property.
+        indicator: Option<String>,
+        /// The engine's status menu, top level. Empty for an xkb engine.
+        menu     : Vec<ImProperty>,
+    },
     /// The frontend stopped and the supervisor is backing off before its next
     /// attempt. Dictation is on the virtual-keyboard path meanwhile.
     Stopped { reason: String },
@@ -112,6 +138,73 @@ pub struct ImEngine {
     pub symbol  : String,
     /// Human-readable name, e.g. `Mozc`.
     pub longname: String,
+}
+
+/// How one status-menu entry is drawn (`IBusPropType`, `src/ibusproperty.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImPropKind {
+    /// A plain action.
+    Normal,
+    /// On or off.
+    Toggle,
+    /// One of a group of siblings.
+    Radio,
+    /// A submenu; `children` are its entries.
+    Menu,
+    /// Spacing.
+    Separator,
+}
+
+/// Whether a toggle or radio is on (`IBusPropState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImPropState {
+    /// Off.
+    Unchecked,
+    /// On.
+    Checked,
+    /// Neither. Engines rarely send it.
+    Inconsistent,
+}
+
+impl ImPropState {
+    /// The state a toggle takes when switched on or off.
+    pub fn from_bool(checked: bool) -> Self {
+        if checked { ImPropState::Checked } else { ImPropState::Unchecked }
+    }
+
+    /// The number the engine wants back in `ActivateProperty`.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            ImPropState::Unchecked    => 0,
+            ImPropState::Checked      => 1,
+            ImPropState::Inconsistent => 2,
+        }
+    }
+}
+
+/// One entry of an IBus engine's status menu, as the popup draws it.
+///
+/// A serde mirror of `IBusProperty` with the fields the applet has a use for:
+/// `icon` and `tooltip` are dropped, and the two enums replace the numeric
+/// type and state so that the popup cannot draw an unknown value as a button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImProperty {
+    /// What `ActivateProperty` takes, e.g. `InputMode.Hiragana`.
+    pub key      : String,
+    /// The text to show. Falls back to the key when the engine sent none.
+    pub label    : String,
+    /// How to draw it.
+    pub kind     : ImPropKind,
+    /// On or off, for toggles and radios.
+    pub state    : ImPropState,
+    /// Whether it can be activated.
+    pub sensitive: bool,
+    /// Whether to draw it at all.
+    pub visible  : bool,
+    /// Short status text, e.g. `あ`. Empty for most entries.
+    pub symbol   : String,
+    /// The entries of a `Menu`; empty for everything else.
+    pub children : Vec<ImProperty>,
 }
 
 impl std::fmt::Display for ImEngine {

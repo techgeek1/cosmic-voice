@@ -6,11 +6,12 @@
 #
 # Same scaffolding as frontend-test.sh — nested cosmic-comp, isolated
 # ibus-daemon with mozc, a GTK entry, keys over libei — plus a fifo standing in
-# for the microphone. `devtest im-frontend --dictation-fifo` reads
-# newline-delimited JSON DictationCmds off it and feeds them to the frontend
-# exactly as the dictation engine would, so the whole turn-taking path runs
-# with no audio, no recogniser and no live session. See README.md, "Safety
-# invariants".
+# for the microphone. `devtest im-frontend --control-fifo` reads
+# newline-delimited JSON commands off it and feeds them to the frontend
+# exactly as the dictation engine would (a bare DictationCmd is accepted as
+# well as the tagged ImCmd form property-test.sh uses), so the whole
+# turn-taking path runs with no audio, no recogniser and no live session. See
+# README.md, "Safety invariants".
 #
 # What it proves, in order:
 #
@@ -91,7 +92,7 @@ ibus_address="$(sed -n 's/^IBUS_ADDRESS=//p' "$IM_HARNESS_STATE/ibus/ibus.env")"
 mkfifo "$FIFO" || { echo "could not create $FIFO"; exit 2; }
 
 setsid "$BIN" devtest im-frontend "$HARNESS_WAYLAND_DISPLAY" "$ibus_address" \
-    --dictation-fifo "$FIFO" \
+    --control-fifo "$FIFO" \
     > "$WORK/frontend.log" 2>&1 &
 frontend_pid=$!
 sleep 2

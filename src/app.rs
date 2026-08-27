@@ -12,16 +12,16 @@ use cosmic::{
     app,
     applet::padded_control,
     iced::{
-        self, Limits, Subscription, window,
+        self, Alignment, Length, Limits, Subscription, window,
         platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
     },
-    widget::{button, settings, text, toggler},
+    widget::{self, button, radio, settings, text, toggler},
 };
 
 use crate::config::Config;
 use crate::engine::{self, Handle};
 use crate::hotkey::key_name;
-use crate::ipc::{Command, Event, InputMethodState};
+use crate::ipc::{Command, Event, ImEngine, ImPropKind, ImPropState, ImProperty, InputMethodState};
 
 const APP_ID: &str = "dev.techgeek1.CosmicExtAppletVoice";
 const POPUP_MIN_WIDTH: f32 = 300.0;
@@ -84,6 +84,16 @@ pub enum Message {
     SetEnabled(bool),
     SetLogging(bool),
     Rebind,
+    /// Switch to the engine at this index of the cycle. An index rather than
+    /// a name because iced's radio wants a `Copy` value.
+    SetEngine(usize),
+    /// Activate one entry of the engine's status menu.
+    ActivateProperty {
+        /// The entry's key.
+        key  : String,
+        /// The state to send, as the engine counts them.
+        state: u32,
+    },
 }
 
 impl cosmic::Application for App {
@@ -173,11 +183,31 @@ impl cosmic::Application for App {
                     let _ = handle.commands.try_send(Command::Rebind);
                 }
             }
+            Message::SetEngine(index) => {
+                if let (Some(handle), Some(engine)) = (ENGINE.get(), self.engine_cycle().get(index)) {
+                    let _ = handle.commands.try_send(Command::SetEngine(engine.name.clone()));
+                }
+            }
+            Message::ActivateProperty { key, state } => {
+                if let Some(handle) = ENGINE.get() {
+                    let _ = handle.commands.try_send(Command::ActivateProperty {
+                        key  : key,
+                        state: state,
+                    });
+                }
+            }
         }
 
         cosmic::iced::Task::none()
     }
 
+    /// The panel button: the microphone, and the input mode beside it.
+    ///
+    /// The glyph is what `ibus-ui-gtk3`'s tray icon used to show — mozc's
+    /// あ / ア / A as the mode changes — and it lives on this button rather
+    /// than in a tray item of its own because there is no longer any process
+    /// whose job that is. Sized and padded like the applet's own icon button,
+    /// so the panel does not grow when the glyph appears.
     fn view(&self) -> Element<'_, Message> {
         let name = match self.state {
             EngineState::Starting     => "content-loading-symbolic",
@@ -198,9 +228,39 @@ impl cosmic::Application for App {
             _ => name,
         };
 
-        self.core
-            .applet
-            .icon_button(name)
+        let Some(glyph) = self.indicator() else {
+            return self
+                .core
+                .applet
+                .icon_button(name)
+                .on_press_down(Message::TogglePopup)
+                .into();
+        };
+
+        let (width, _) = self.core.applet.suggested_size(true);
+        let (major, minor) = self.core.applet.suggested_padding(true);
+        let icon = widget::icon::from_name(name).symbolic(true).size(width);
+        let glyph = self.core.applet.text(glyph);
+        let content: Element<'_, Message> = if self.core.applet.is_horizontal() {
+            widget::row::with_capacity(2)
+                .push(icon)
+                .push(glyph)
+                .spacing(minor)
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            widget::column::with_capacity(2)
+                .push(icon)
+                .push(glyph)
+                .spacing(minor)
+                .align_x(Alignment::Center)
+                .into()
+        };
+        let padding = if self.core.applet.is_horizontal() { [minor, major] } else { [major, minor] };
+
+        button::custom(content)
+            .padding(padding)
+            .class(cosmic::theme::Button::AppletIcon)
             .on_press_down(Message::TogglePopup)
             .into()
     }
@@ -238,7 +298,7 @@ impl cosmic::Application for App {
             ))
             .add(settings::item("Trigger key", rebind));
 
-        let mut content = cosmic::widget::column::with_capacity(4)
+        let mut content = cosmic::widget::column::with_capacity(6)
             .padding([8, 0])
             .spacing(8)
             .push(padded_control(text::heading(status)));
@@ -249,9 +309,181 @@ impl cosmic::Application for App {
             content = content.push(padded_control(text::body(line)));
         }
         content = content.push(padded_control(controls));
+        for section in self.input_method_sections() {
+            content = content.push(padded_control(section));
+        }
 
         self.core.applet.popup_container(content).into()
     }
+}
+
+// --- The input-method section ---
+
+impl App {
+    /// The engines the switch hotkey cycles through, or nothing while the
+    /// multiplexer is not running.
+    fn engine_cycle(&self) -> &[ImEngine] {
+        match &self.input_method {
+            InputMethodState::Running { engines, .. } => engines,
+            _                                         => &[],
+        }
+    }
+
+    /// The live mode glyph, only while the multiplexer is running.
+    fn indicator(&self) -> Option<&str> {
+        match &self.input_method {
+            InputMethodState::Running { indicator, .. } => indicator.as_deref(),
+            _                                           => None,
+        }
+    }
+
+    /// The "Input method" part of the popup: the engine cycle, then the
+    /// engine's own menu.
+    ///
+    /// Sections rather than one list because that is the shape the menu has:
+    /// the engine cycle is one group of choices, and every `Menu` property —
+    /// mozc's input modes, mozc's tools — is another with a title of its
+    /// own. Everything that is not a menu sits in the first section under
+    /// the engines. Empty while there is nothing to show, so a running
+    /// multiplexer with an xkb engine and nothing configured to cycle to
+    /// adds nothing to the popup.
+    fn input_method_sections(&self) -> Vec<Element<'_, Message>> {
+        let InputMethodState::Running { engine, engines, menu, .. } = &self.input_method else {
+            return Vec::new();
+        };
+        let mut sections = Vec::new();
+
+        let current = engine
+            .as_ref()
+            .and_then(|current| engines.iter().position(|entry| entry.name == current.name));
+        let mut top = settings::section().title("Input method");
+        let mut has_rows = false;
+        for (index, entry) in engines.iter().enumerate() {
+            top = top.add(
+                radio(text::body(entry.to_string()), index, current, Message::SetEngine)
+                    .width(Length::Fill),
+            );
+            has_rows = true;
+        }
+
+        // The menu itself. A `Menu` becomes a section; everything else at
+        // the top level joins the engine section.
+        let mut menus = Vec::new();
+        for property in menu.iter().filter(|property| property.visible) {
+            match property.kind {
+                ImPropKind::Menu => menus.push(property),
+                _                => {
+                    if let Some(row) = menu_row(property, None) {
+                        top = top.add(row);
+                        has_rows = true;
+                    }
+                }
+            }
+        }
+        if has_rows {
+            sections.push(top.into());
+        }
+        for property in menus {
+            if let Some(section) = menu_section(property) {
+                sections.push(section);
+            }
+        }
+
+        sections
+    }
+}
+
+/// One `Menu` property as a titled section of its entries.
+///
+/// Radio children share one selection, which is why they are drawn here
+/// with the group in hand rather than one at a time: iced's radio wants to
+/// know which sibling is checked. A menu nested inside a menu is flattened
+/// into its parent's section under a heading, since a popup has no room for
+/// submenus and the engines that exist do not nest.
+fn menu_section(property: &ImProperty) -> Option<Element<'_, Message>> {
+    let mut section = settings::section().title(property.label.clone());
+    let mut rows = 0;
+    let checked = property
+        .children
+        .iter()
+        .filter(|child| child.visible)
+        .position(|child| child.kind == ImPropKind::Radio && child.state == ImPropState::Checked);
+
+    for (index, child) in property.children.iter().filter(|child| child.visible).enumerate() {
+        match child.kind {
+            ImPropKind::Menu => {
+                section = section.add(text::caption_heading(child.label.clone()));
+                for grandchild in child.children.iter().filter(|child| child.visible) {
+                    if let Some(row) = menu_row(grandchild, None) {
+                        section = section.add(row);
+                        rows += 1;
+                    }
+                }
+            }
+            _ => {
+                if let Some(row) = menu_row(child, Some((index, checked))) {
+                    section = section.add(row);
+                    rows += 1;
+                }
+            }
+        }
+    }
+
+    if rows == 0 { None } else { Some(section.into()) }
+}
+
+/// One non-menu property as a popup row.
+///
+/// `group` is the row's index within its radio group and the group's checked
+/// index, for a radio; a radio outside any group is drawn as a button, since
+/// there is nothing for it to be exclusive with. An insensitive entry keeps
+/// its row and loses its message, which is what a greyed-out menu item is —
+/// for a radio that means a button with no press, because iced's radio has
+/// no disabled form.
+fn menu_row(
+    property: &ImProperty,
+    group   : Option<(usize, Option<usize>)>,
+) -> Option<Element<'_, Message>> {
+    let key = property.key.clone();
+    let row: Element<'_, Message> = match property.kind {
+        ImPropKind::Separator => widget::divider::horizontal::light().into(),
+        ImPropKind::Toggle => {
+            let checked = property.state == ImPropState::Checked;
+            let toggle = toggler(checked).on_toggle_maybe(property.sensitive.then_some(
+                move |on: bool| Message::ActivateProperty {
+                    key  : key.clone(),
+                    state: ImPropState::from_bool(on).as_u32(),
+                },
+            ));
+            settings::item(property.label.clone(), toggle).into()
+        }
+        ImPropKind::Radio if group.is_some() && property.sensitive => {
+            let (index, checked) = group.expect("matched on is_some");
+            // Checked, not the row's own state: mozc acts on an input mode
+            // only when the activation says checked, and a radio that is
+            // pressed is being chosen.
+            radio(text::body(property.label.clone()), index, checked, move |_| {
+                Message::ActivateProperty {
+                    key  : key,
+                    state: ImPropState::Checked.as_u32(),
+                }
+            })
+            .width(Length::Fill)
+            .into()
+        }
+        ImPropKind::Normal | ImPropKind::Radio | ImPropKind::Menu => {
+            let message = property.sensitive.then(|| Message::ActivateProperty {
+                key  : key,
+                state: ImPropState::Checked.as_u32(),
+            });
+            button::text(property.label.clone())
+                .on_press_maybe(message)
+                .width(Length::Fill)
+                .into()
+        }
+    };
+
+    Some(row)
 }
 
 impl App {
@@ -303,11 +535,17 @@ impl App {
     ///
     /// Only while the multiplexer is actually running: a name left over from
     /// before a frontend died would claim an input method that is not there.
+    /// The glyph is the live indicator when the engine has one — mozc's
+    /// current mode — and the engine's static symbol otherwise.
     fn engine_label(&self) -> Option<String> {
-        match &self.input_method {
-            InputMethodState::Running { engine } => engine.as_ref().map(ToString::to_string),
-            _                                    => None,
-        }
+        let InputMethodState::Running { engine, indicator, .. } = &self.input_method else {
+            return None;
+        };
+        let engine = engine.as_ref()?;
+        let name = if engine.longname.is_empty() { &engine.name } else { &engine.longname };
+        let glyph = indicator.as_deref().unwrap_or(&engine.symbol);
+
+        Some(if glyph.is_empty() { name.clone() } else { format!("{name} {glyph}") })
     }
 
     /// The extra popup line for an input method that needs explaining.
@@ -323,7 +561,7 @@ impl App {
             InputMethodState::Stopped { reason } => {
                 Some(format!("Input method: not running — {reason}"))
             }
-            InputMethodState::Running { engine: None } => {
+            InputMethodState::Running { engine: None, .. } => {
                 Some("Input method: bound, waiting for IBus".to_owned())
             }
             InputMethodState::Running { .. } => None,

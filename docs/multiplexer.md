@@ -1117,3 +1117,142 @@ not this paragraph, and prove it with a round trip.
    section says what the popup now shows and that the tray icon is gone on
    purpose), and the usual: `cargo test`, `cargo build` before any harness
    run, all five suites, nothing bound on the live display.
+
+## Findings from phase 6 (2026-08-27)
+
+Putting the panel presence into the applet — the mode glyph, the status menu,
+the engine cycle — against ibus 1.5.34, mozc 3.34 and libcosmic turned up
+these corrections. Citations are into the 1.5.34 tree unless stated.
+
+1. **The daemon sends empty property lists of its own, three ways, and none
+   of them is the engine speaking.** `bus_input_context_register_properties
+   (context, props_empty)` is called from `bus_input_context_focus_out`
+   (`bus/inputcontext.c:2037`), from `bus_input_context_disable` (`:2992`)
+   and from `bus_input_context_unset_engine` (`:3051`), and with
+   `IBUS_CAP_PROPERTY` set every one of them is emitted as a
+   `RegisterProperties` signal on the context exactly like mozc's. The plan
+   said "the cache is cleared on `GlobalEngineChanged` and refilled by the
+   next `RegisterProperties`"; the daemon's *own* registrations are what make
+   that both unnecessary in one case and wrong in another. The focus-out one
+   would blank the glyph every time focus left a text field, which
+   `ibus-ui-gtk3` never did — its `set_property` only touches the icon on a
+   non-empty symbol (`ui/gtk3/panel.vala:1793-1795`), so an empty list left
+   the glyph standing. The frontend therefore drops an empty registration
+   that arrives while no field is active, and honours everything else.
+2. **Clearing on `GlobalEngineChanged` races the context stream, and loses.**
+   A switch while our context is focused runs
+   `bus_input_context_set_engine`: unset the old engine (empty registration),
+   attach the new one, `FocusIn` it (`:3070-3100`), after which mozc
+   registers — all on the context connection, in that order. The
+   `GlobalEngineChanged` broadcast leaves the daemon between the empty and
+   mozc's list, but it travels the *panel* connection, a different socket
+   read by a different thread, so it can be processed after mozc's
+   registration and would wipe it. Measured in the harness: on the switch
+   back into `mozc-on` the broadcast landed 2ms before mozc's registration —
+   the right order, by a margin that is the engine process's round trip and
+   nothing else. The context stream already carries the change in order, so
+   with a field active the frontend clears nothing on the broadcast; it
+   clears only with no field active, when nothing is coming on the context
+   stream and the menu belongs to an engine no longer in effect. Either way
+   it republishes, because the engine's `icon_prop_key` changed under
+   whatever list there is. The daemon's empty registration arrives *twice*
+   per switch while focused, from `unset_engine` and again from the new
+   engine's attach path, both before anything else; harmless, since both
+   are honoured into the same empty state.
+3. **`PropertyActivate` needs the state spelled out, and for mozc it must be
+   `CHECKED`.** `ProcessPropertyActivate` (`unix/ibus/property_handler.cc`)
+   handles the tool entries first and ignores the state for them, then
+   returns early unless `property_state == PROP_STATE_CHECKED`, and only then
+   looks for an input mode. An activation that sends the radio's *current*
+   state (unchecked, since it is the one being chosen) does nothing, silently.
+   `ibus-ui-gtk3` sends `CHECKED` for a radio and the toggled value for a
+   toggle; so does the popup, and the CLI's `property <key>` defaults to
+   `checked` for the same reason.
+4. **A mode change is a burst of `UpdateProperty`, and the last one carries
+   the menu with its children attached.** `UpdateCompositionModeIcon` sends
+   each radio child with its new state, then the `InputMode` menu itself with
+   the new label, icon and symbol — and, being an `IBusProperty`, with its
+   `sub_props` serialised along. An update therefore has to *replace* the
+   matched entry wholesale, children included, rather than patch its scalar
+   fields; a merge that kept the old children would be right by accident
+   here and wrong for any engine that uses an update to prune a submenu. The
+   glyph in direct mode is `A`, not the `_A` of half-width Latin. Seven
+   updates per mode change also means seven snapshots if each is published
+   as it lands — and, unlike the candidate window's burst (phase-3 finding
+   10), calloop's post-dispatch callback does not collapse them: each update
+   is its own engine round trip and its own wake-up of the loop, measured
+   ~130µs apart, seven dispatches for seven signals. The frontend therefore
+   holds a snapshot for 20ms after the first change and publishes once,
+   which the harness log shows as one line per mode change.
+5. **`symbol` is the eleventh field, after `sub_props`, and mozc's tools live
+   under `MozcTool`, not `Tool`.** The wire order is `key, type, label, icon,
+   tooltip, sensitive, visible, state, sub_props, symbol`
+   (`src/ibusproperty.c:362-401`, "Keep the serialized order for the
+   compatibility when add new members"); a decoder that put `symbol` beside
+   `label` would read the tooltip as the glyph and pass its own round trip.
+   The fixture test keys the layout in by hand for that reason. mozc's tool
+   menu has key `MozcTool`, and its children on this machine's mozc 3.34 are
+   `config_dialog`, `dictionary_tool`, `word_register_dialog` and
+   `about_dialog` — current mozc's `property_handler.cc` spells them
+   `Tool.ConfigDialog` and so on, which is what reading the source instead
+   of the wire would have put in the fixture. The menu is only registered
+   when `mozc_tool` is installed (`IsMozcToolAvailable`), so a list with one
+   entry is not a decoding error. The input modes are `InputMode.Direct`,
+   `.Hiragana`, `.Katakana`, `.Latin`, `.WideLatin`, `.HalfWidthKatakana`,
+   as planned.
+6. **One link, not two.** The plan asked for the engine-to-frontend road to
+   be generalised rather than doubled, and the shape that fell out is
+   [`im::command`]: one `ImCmd` enum carrying `Dictation(DictationCmd)`,
+   `SetEngine` and `ActivateProperty`, one calloop channel, and the status
+   flags beside it. `im::dictation` keeps only the decision and its tests.
+   The control fifo accepts both the tagged form and a bare `DictationCmd`,
+   so `dictation-test.sh` did not have to change its lines, only its flag.
+7. **The applet's snapshot has to carry the cycle as well as the current
+   engine, and the engine process has to merge.** Three producers now feed
+   `ImEvent` — the switcher (engine, cycle), the frontend (menu, glyph), the
+   supervisor (bound, blocked, stopped) — and each knows one part of
+   `InputMethodState::Running`. The engine folds them: every event starts
+   from whatever was already known and overwrites its own field, so a
+   `Properties` event cannot blank the engine name and an `EngineChanged`
+   cannot forget the cycle. Mirrors get the whole thing through the snapshot,
+   which is why nothing in it is an `ibus` type.
+8. **The harness needs the screens on.** Found by losing an hour to it:
+   with every output at DPMS off the live cosmic-comp stops presenting, and
+   the nested cosmic-comp under winit blocks its *main thread* in
+   `wl_display_dispatch_queue` on the host connection — so it accepts
+   connections and answers nothing, `wayland-info` included, and `comp.log`
+   is identical to a healthy start. `/sys/class/drm/card*-*/dpms` is the
+   diagnostic. Not a code finding, but the first thing to check before the
+   next one is mistaken for a regression.
+9. Minor: the popup cannot be exercised in the harness — there is no applet
+   in the loop and no screenshot path (phase-3 finding 9) — so the panel
+   button with the glyph beside the microphone and the "Input method"
+   section are asserted only through the snapshot the frontend publishes,
+   and looked at live. iced's radio wants a `Copy` value, so the engine rows
+   carry an index into the cycle and the property rows carry their key in
+   the closure; an insensitive radio is drawn as a disabled button because
+   iced's radio has no disabled form. The `devtest ibus-keys` dump now prints
+   properties decoded, which is the fastest way to see what an engine
+   actually sends and is safe on the live daemon.
+
+### What was verified, and how
+
+`scripts/im-harness/property-test.sh` is the phase-6 regression, thirteen
+assertions green on 2026-08-27 against the nested compositor and the scratch
+daemon: mozc's registration arrives on our context with an `InputMode` menu
+of two top-level entries, the glyph is あ, `ActivateProperty
+InputMode.Direct` produces the checked radio update and turns the glyph into
+`A`, `konnnitiha` then arrives as ASCII, `InputMode.Hiragana` converts
+あいうえお again and commits into the same field, `SetEngine xkb:us::eng`
+empties both the menu and the glyph through the daemon's own unset-engine
+registration, and `SetEngine mozc-on` brings both back. The codec is a round
+trip plus a hand-keyed upstream layout in `ibus::text::tests`, and the model
+is seven unit tests in `im::properties`.
+
+`frontend-test.sh`, `candidate-test.sh`, `switcher-test.sh` and
+`dictation-test.sh` all still pass; the last one now spells the fifo flag
+`--control-fifo`.
+
+What still needs a human: the applet itself — the glyph on the panel button,
+the radio rows, the togglers, and whether pressing an input mode in the popup
+is answered by the glyph changing — which the harness cannot reach.

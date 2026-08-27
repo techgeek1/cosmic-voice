@@ -31,7 +31,7 @@
 use anyhow::{Context, Result};
 
 use crate::config::{Config, InputMethod};
-use crate::im::{DictationCmd, DictationLink};
+use crate::im::{DictationCmd, ImLink};
 use crate::inject::Injector;
 
 // --- The sink ---
@@ -45,7 +45,7 @@ pub struct TextSink {
     /// The multiplexer's frontend, when the config asked for one. Sends are
     /// dropped while no frontend is running, which is the same state the
     /// engine already handles by falling back.
-    im    : Option<DictationLink>,
+    im    : Option<ImLink>,
 }
 
 impl TextSink {
@@ -55,7 +55,7 @@ impl TextSink {
     /// Failing to reach the compositor is fatal, because then there is no way
     /// to type at all. Failing to bind the input method is not: the supervisor
     /// reports it and the virtual keyboard carries on.
-    pub fn connect(config: &Config, link: Option<DictationLink>) -> Result<Self> {
+    pub fn connect(config: &Config, link: Option<ImLink>) -> Result<Self> {
         // `false`, unconditionally, in both modes. See the module docs.
         let inject = Injector::connect(false).context("connecting the injector")?;
 
@@ -74,7 +74,7 @@ impl TextSink {
     /// changes with focus and the whole point of asking is to catch the field
     /// going away mid-utterance.
     fn im_active(&self) -> bool {
-        self.im.as_ref().is_some_and(DictationLink::is_active)
+        self.im.as_ref().is_some_and(ImLink::is_active)
     }
 
     /// Announces the start of an utterance, so the input method can finish
@@ -84,7 +84,7 @@ impl TextSink {
     /// a turn from.
     pub fn begin(&mut self) {
         if let Some(link) = self.im.as_ref() {
-            link.send(DictationCmd::Begin);
+            link.dictate(DictationCmd::Begin);
         }
     }
 
@@ -99,7 +99,7 @@ impl TextSink {
             self.im
                 .as_ref()
                 .expect("im_active implies a link")
-                .send(DictationCmd::Partial(text.to_owned()));
+                .dictate(DictationCmd::Partial(text.to_owned()));
             return Ok(true);
         }
 
@@ -118,7 +118,7 @@ impl TextSink {
             self.im
                 .as_ref()
                 .expect("im_active implies a link")
-                .send(DictationCmd::Commit(text.to_owned()));
+                .dictate(DictationCmd::Commit(text.to_owned()));
             return Ok(true);
         }
 
@@ -132,7 +132,7 @@ impl TextSink {
     /// calls are no-ops when there is nothing to clear.
     pub fn cancel(&mut self) {
         if let Some(link) = self.im.as_ref() {
-            link.send(DictationCmd::Cancel);
+            link.dictate(DictationCmd::Cancel);
         }
         if let Err(e) = self.inject.preedit("") {
             tracing::debug!("clearing the preedit: {e:#}");

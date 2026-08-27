@@ -44,7 +44,7 @@ pub fn run(args: &[String]) -> Result<()> {
              finalize <model_dir> <wav> [threads] | capture <secs> | keys | rebind | \
              inject-probe | type <secs> <text> | ibus-info | ibus-keys <engine> <key>… | \
              im-frontend <wayland-display> [ibus-address] [--config <path>] \
-             [--dictation-fifo <path>]"
+             [--control-fifo <path>]"
         )),
     }
 }
@@ -528,11 +528,14 @@ fn parse_key_spec(spec: &str) -> Result<(u32, u32)> {
 /// `ibus_triggers` and `ibus_engines` mean the same thing here as they will in
 /// the shipped applet.
 ///
-/// `--dictation-fifo <path>` stands in for the microphone. Newline-delimited
-/// JSON [`crate::im::DictationCmd`]s read from the fifo are fed into the
-/// frontend exactly as the dictation engine would feed them, which is what
-/// lets a shell script exercise turn-taking against a real mozc with no audio
-/// and no recogniser. See `scripts/im-harness/dictation-test.sh`.
+/// `--control-fifo <path>` stands in for the rest of the process.
+/// Newline-delimited JSON [`crate::im::ImCmd`]s read from the fifo are fed
+/// into the frontend exactly as the engine would feed them — a bare
+/// [`crate::im::DictationCmd`] is accepted too, for the microphone's sake —
+/// which is what lets a shell script exercise turn-taking and the status menu
+/// against a real mozc with no audio, no recogniser and no panel. See
+/// `scripts/im-harness/dictation-test.sh` and `property-test.sh`.
+/// `--dictation-fifo` is the older spelling of the same flag.
 fn im_frontend(args: &[String]) -> Result<()> {
     let mut display = None;
     let mut address = None;
@@ -551,11 +554,11 @@ fn im_frontend(args: &[String]) -> Result<()> {
                         .clone(),
                 );
             }
-            "--dictation-fifo"     => {
+            "--control-fifo" | "--dictation-fifo" => {
                 fifo_path = Some(
                     arguments
                         .next()
-                        .ok_or_else(|| anyhow!("--dictation-fifo needs a path"))?
+                        .ok_or_else(|| anyhow!("{argument} needs a path"))?
                         .clone(),
                 );
             }
@@ -568,7 +571,7 @@ fn im_frontend(args: &[String]) -> Result<()> {
     let Some(display) = display else {
         return Err(anyhow!(
             "usage: cosmic-voice devtest im-frontend <wayland-display> [ibus-address] \
-             [--config <path>] [--dictation-fifo <path>]"
+             [--config <path>] [--control-fifo <path>]"
         ));
     };
 
@@ -586,10 +589,10 @@ fn im_frontend(args: &[String]) -> Result<()> {
         None => crate::config::Config::load(),
     };
 
-    let dictation = match fifo_path {
+    let link = match fifo_path {
         Some(path) => {
-            let link = crate::im::DictationLink::new();
-            spawn_dictation_fifo(path, link.clone())?;
+            let link = crate::im::ImLink::new();
+            spawn_control_fifo(path, link.clone())?;
             Some(link)
         }
         None => None,
@@ -602,11 +605,11 @@ fn im_frontend(args: &[String]) -> Result<()> {
         triggers    : config.ibus_triggers,
         engines     : config.ibus_engines,
         events      : None,
-        dictation   : dictation,
+        link        : link,
     })
 }
 
-/// Reads dictation commands off a fifo and feeds them to the frontend.
+/// Reads commands off a fifo and feeds them to the frontend.
 ///
 /// On its own thread because opening a fifo for reading blocks until somebody
 /// opens the write end, and every read after the last writer closes returns
@@ -617,7 +620,7 @@ fn im_frontend(args: &[String]) -> Result<()> {
 ///
 /// The fifo has to exist already. Creating it here would race the script that
 /// is about to write to it, and `mkfifo` in the script is one line.
-fn spawn_dictation_fifo(path: String, link: crate::im::DictationLink) -> Result<()> {
+fn spawn_control_fifo(path: String, link: crate::im::ImLink) -> Result<()> {
     use std::io::BufRead;
 
     if !std::path::Path::new(&path).exists() {
@@ -625,7 +628,7 @@ fn spawn_dictation_fifo(path: String, link: crate::im::DictationLink) -> Result<
     }
 
     std::thread::Builder::new()
-        .name("dictation-fifo".to_string())
+        .name("control-fifo".to_string())
         .spawn(move || {
             loop {
                 match std::fs::File::open(&path) {
@@ -636,16 +639,16 @@ fn spawn_dictation_fifo(path: String, link: crate::im::DictationLink) -> Result<
                             if line.is_empty() {
                                 continue;
                             }
-                            match serde_json::from_str::<crate::im::DictationCmd>(line) {
+                            match parse_control_line(line) {
                                 Ok(command) => link.send(command),
                                 Err(e)      => {
-                                    tracing::error!("dictation fifo: {line:?} is not a command: {e}")
+                                    tracing::error!("control fifo: {line:?} is not a command: {e}")
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::error!("dictation fifo {path}: {e}");
+                        tracing::error!("control fifo {path}: {e}");
                         return;
                     }
                 }
@@ -654,9 +657,21 @@ fn spawn_dictation_fifo(path: String, link: crate::im::DictationLink) -> Result<
                 std::thread::sleep(Duration::from_millis(50));
             }
         })
-        .context("spawning the dictation fifo reader")?;
+        .context("spawning the control fifo reader")?;
 
     Ok(())
+}
+
+/// Parses one fifo line as an [`crate::im::ImCmd`], or as a bare
+/// [`crate::im::DictationCmd`] for the scripts written before there was
+/// anything else to send.
+fn parse_control_line(line: &str) -> Result<crate::im::ImCmd> {
+    match serde_json::from_str::<crate::im::ImCmd>(line) {
+        Ok(command) => Ok(command),
+        Err(first)  => serde_json::from_str::<crate::im::DictationCmd>(line)
+            .map(crate::im::ImCmd::Dictation)
+            .map_err(|_| anyhow!("{first}")),
+    }
 }
 
 /// Indents a multi-line block for the report layout.
@@ -672,7 +687,23 @@ fn indent(block: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_spec;
+    use super::{parse_control_line, parse_key_spec};
+    use crate::im::{DictationCmd, ImCmd};
+
+    /// Both spellings the harness scripts use: the bare dictation command
+    /// `dictation-test.sh` has always written, and the tagged form.
+    #[test]
+    fn control_lines_accept_both_spellings() {
+        assert_eq!(
+            parse_control_line(r#"{"Partial":"hello"}"#).expect("bare"),
+            ImCmd::Dictation(DictationCmd::Partial("hello".to_string()))
+        );
+        assert_eq!(
+            parse_control_line(r#"{"SetEngine":"mozc-on"}"#).expect("tagged"),
+            ImCmd::SetEngine("mozc-on".to_string())
+        );
+        assert!(parse_control_line("nonsense").is_err());
+    }
 
     /// The keysym resolution in `ibus-keys` is the one part of that check that
     /// can be verified without a daemon and without stealing anybody's focus,

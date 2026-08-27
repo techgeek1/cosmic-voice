@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::ImEvent;
-use super::dictation::DictationLink;
+use super::command::ImLink;
 
 /// Delay before the first restart attempt.
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
@@ -81,8 +81,8 @@ pub struct Supervised {
     pub triggers : Vec<String>,
     /// Engine ids to cycle through, or empty for dconf's.
     pub engines  : Vec<String>,
-    /// The dictation engine's end of the turn-taking channel.
-    pub dictation: DictationLink,
+    /// The process's end of the command channel into the frontend.
+    pub link     : ImLink,
     /// Where the applet's state line comes from.
     pub events   : UnboundedSender<ImEvent>,
 }
@@ -143,7 +143,7 @@ fn run_supervised(supervised: Supervised) {
             triggers    : supervised.triggers.clone(),
             engines     : supervised.engines.clone(),
             events      : Some(supervised.events.clone()),
-            dictation   : Some(supervised.dictation.clone()),
+            link        : Some(supervised.link.clone()),
         });
 
         let reason = match outcome {

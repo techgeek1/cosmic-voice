@@ -119,10 +119,11 @@ backward registration exists and that the flag — which travels in the
     scripts/im-harness/dictation-test.sh
 
 The phase-5 turn-taking, end to end. Same scaffolding as `frontend-test.sh`,
-plus a fifo passed with `devtest im-frontend --dictation-fifo`: the frontend
-reads newline-delimited JSON `DictationCmd`s off it and feeds them in exactly
-as the dictation engine would, so the whole path runs with no audio, no
-recogniser and no engine process. `dictate '"Begin"'` and
+plus a fifo passed with `devtest im-frontend --control-fifo`: the frontend
+reads newline-delimited JSON commands off it and feeds them in exactly as the
+dictation engine would, so the whole path runs with no audio, no recogniser
+and no engine process. A bare `DictationCmd` is accepted as well as the
+tagged `ImCmd` form (`--dictation-fifo` is the older spelling of the flag). `dictate '"Begin"'` and
 `dictate '{"Partial":"hello wor"}'` are the whole interface; each write is its
 own open/write/close, which is what the reader's reopen loop is for.
 
@@ -142,6 +143,43 @@ decision itself is a unit test (`im::dictation::tests`); what only a real
 daemon can prove is that the preedit really was held under
 `ClientCommitPreedit` with mode=commit, and that resetting the context behind
 the flush leaves mozc able to convert again — which is the last two.
+
+    scripts/im-harness/property-test.sh
+
+The phase-6 panel presence, end to end: the engine's status menu and mode
+glyph, arriving on our own input context because `CAP_PROPERTY` is in its
+capabilities. Same scaffolding as `dictation-test.sh` (the control fifo now
+carries tagged `ImCmd`s: `{"ActivateProperty":{"key":"InputMode.Direct",
+"state":1}}`, `{"SetEngine":"xkb:us::eng"}`) plus `switcher-test.sh`'s config
+override, and the frontend at debug level, because with no applet in the loop
+the evidence is the snapshot the frontend would have published to one:
+
+    PASS: mozc registered an InputMode menu on our context
+    PASS: the indicator is mozc's hiragana glyph
+    PASS: the menu has mozc's two top-level entries
+    PASS: InputMode.Direct changed the indicator
+    PASS: mozc updated the radio child as checked
+    PASS: in direct mode konnnitiha arrives as ASCII
+    PASS: InputMode.Hiragana restored the indicator
+    PASS: hiragana converts again
+    PASS: and commits into the field
+    PASS: SetEngine xkb:us::eng cleared the indicator
+    PASS: and the menu
+    PASS: SetEngine mozc-on re-registered the menu
+    PASS: with both entries
+
+The model itself is a unit test (`im::properties::tests`); what only a real
+engine can prove is the wire shape of mozc's registration, that an activation
+sent with state `checked` is what flips its mode, and that the daemon's own
+empty registration on an engine change arrives in order on the context
+stream.
+
+**The nested compositor needs the screens on.** Under the winit backend
+cosmic-comp blocks in `wl_display_dispatch_queue` on the *host* connection
+while the host is not presenting, and with every output at DPMS off the live
+cosmic-comp stops presenting. Every harness client then hangs in its first
+roundtrip — `wayland-info` included — with nothing in `comp.log` to say so.
+Check `/sys/class/drm/card*-*/dpms` before suspecting the code.
 
     scripts/im-harness/smoke-test.sh ["text to type"]
 

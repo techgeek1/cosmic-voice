@@ -19,9 +19,9 @@ use crate::asr::{AsrEvent, OfflineCmd, StreamCmd};
 use crate::audio::Capture;
 use crate::config::{Config, FallbackPartials, InputMethod};
 use crate::hotkey::{HotkeyEvent, KeyEdge, Watcher};
-use crate::im::{DictationLink, ImEvent};
+use crate::im::{ImCmd, ImEvent, ImLink};
 use crate::inject::common_prefix_len;
-use crate::ipc::{Command, Event, ImEngine, InputMethodState};
+use crate::ipc::{Command, Event, InputMethodState};
 use crate::sink::TextSink;
 use crate::transcript_log;
 use crate::vad::{SegmentGate, SilenceGate};
@@ -174,11 +174,11 @@ async fn run_mirror(
 /// input-method slot and the panel spawns one applet per output, so "the
 /// mirrors must not bind" is not a rule anybody has to remember.
 ///
-/// Returns the engine's end of the turn-taking link and the frontend's event
+/// Returns the process's end of the command link and the frontend's event
 /// stream, or `(None, None)` when the config leaves the slot alone.
 fn start_input_method(
     config: &Config,
-) -> (Option<DictationLink>, Option<mpsc::UnboundedReceiver<ImEvent>>) {
+) -> (Option<ImLink>, Option<mpsc::UnboundedReceiver<ImEvent>>) {
     if config.input_method != InputMethod::Multiplexer {
         return (None, None);
     }
@@ -190,14 +190,14 @@ fn start_input_method(
         return (None, None);
     };
 
-    let link = DictationLink::new();
+    let link = ImLink::new();
     let (events, receiver) = mpsc::unbounded_channel::<ImEvent>();
     crate::im::spawn(crate::im::Supervised {
-        display  : display,
-        triggers : config.ibus_triggers.clone(),
-        engines  : config.ibus_engines.clone(),
-        dictation: link.clone(),
-        events   : events,
+        display : display,
+        triggers: config.ibus_triggers.clone(),
+        engines : config.ibus_engines.clone(),
+        link    : link.clone(),
+        events  : events,
     });
 
     (Some(link), Some(receiver))
@@ -233,6 +233,10 @@ struct Engine {
     /// Wayland text output, over whichever path the focus and the config
     /// allow.
     sink       : TextSink,
+    /// The command link into the input-method thread, for the requests that
+    /// are not text: an engine switch, a menu activation. `None` without the
+    /// multiplexer. The sink holds its own clone for the text.
+    im_link    : Option<ImLink>,
     /// What the input-method thread has told us, folded into the one state the
     /// popup renders. Owned here rather than in the applet so that mirrors get
     /// it through the snapshot like everything else.
@@ -287,7 +291,7 @@ impl Engine {
     fn create(config: Config, events: broadcast::Sender<Event>) -> Result<Self> {
         let capture = Capture::start(config.preroll_ms).context("starting audio capture")?;
         let (link, im_events) = start_input_method(&config);
-        let sink = TextSink::connect(&config, link)?;
+        let sink = TextSink::connect(&config, link.clone())?;
         tracing::info!("text output ready: {}", sink.status());
         let asr = crate::asr::spawn(&config);
 
@@ -331,6 +335,7 @@ impl Engine {
             offline    : asr.offline,
             asr_events : asr.events,
             sink       : sink,
+            im_link    : link,
             im_state   : im_state,
             im_events  : im_events,
             events     : events,
@@ -431,11 +436,21 @@ impl Engine {
 
     /// Handles a command from the applet or the control socket.
     fn on_command(&mut self, cmd: Command) {
+        // The input-method requests are independent of the capture cycle and
+        // of whether dictation is armed: switching engines with the trigger
+        // disarmed is exactly what "disarm, keep typing" means.
         match cmd {
             Command::Enable        => return self.set_enabled(true),
             Command::Disable       => return self.set_enabled(false),
             Command::SetLogging(on) => return self.set_logging(on),
             Command::Rebind        => return self.start_rebind(),
+            Command::SetEngine(name) => return self.send_im(ImCmd::SetEngine(name)),
+            Command::ActivateProperty { key, state } => {
+                return self.send_im(ImCmd::ActivateProperty {
+                    key  : key,
+                    state: state,
+                });
+            }
             _ if !self.enabled || self.rebinding => return,
             _                      => {}
         }
@@ -508,34 +523,74 @@ impl Engine {
         self.emit(if self.enabled { Event::Idle } else { Event::Disabled });
     }
 
+    /// Hands one request to the input-method thread, if there is one.
+    fn send_im(&self, command: ImCmd) {
+        match self.im_link.as_ref() {
+            Some(link) => link.send(command),
+            None       => tracing::warn!("ignoring {command:?}: the multiplexer is off"),
+        }
+    }
+
     /// Folds one input-method event into the state the popup renders.
     ///
-    /// The two producers say different things about the same subject — the
-    /// switcher knows which engine is in effect, the supervisor knows whether
-    /// a frontend is running — so the engine keeps one state and each event
-    /// updates the part it knows about. An `EngineChanged` while blocked, for
-    /// instance, cannot happen, but an `EngineChanged` arriving one event
-    /// before `Bound` can, and the engine is the only place that can hold both
-    /// halves.
+    /// The producers say different things about the same subject — the
+    /// switcher knows which engine is in effect and which ones the cycle
+    /// holds, the frontend holds the engine's menu, the supervisor knows
+    /// whether a frontend is running — so the engine keeps one state and each
+    /// event updates the part it knows about. An `EngineChanged` while blocked,
+    /// for instance, cannot happen, but an `EngineChanged` arriving one event
+    /// before `Bound` can, and the engine is the only place that can hold all
+    /// the pieces.
     fn on_im_event(&mut self, event: ImEvent) {
+        // Whatever was already known about the running state carries over,
+        // so that a menu update does not blank the engine name or a switch
+        // forget the cycle.
+        let (mut engine, mut engines, mut indicator, mut menu) = match &self.im_state {
+            InputMethodState::Running { engine, engines, indicator, menu } => (
+                engine.clone(),
+                engines.clone(),
+                indicator.clone(),
+                menu.clone(),
+            ),
+            _ => (None, Vec::new(), None, Vec::new()),
+        };
         let state = match event {
-            ImEvent::EngineChanged { name, symbol, longname } => {
+            ImEvent::EngineChanged(changed) => {
+                engine = Some(changed);
                 InputMethodState::Running {
-                    engine: Some(ImEngine {
-                        name    : name,
-                        symbol  : symbol,
-                        longname: longname,
-                    }),
+                    engine   : engine,
+                    engines  : engines,
+                    indicator: indicator,
+                    menu     : menu,
                 }
             }
-            // Keep whichever engine we already knew about: binding says
-            // nothing about the daemon, and losing the name would blank the
-            // status line for as long as the engine stays unchanged.
+            ImEvent::Engines(cycle) => {
+                engines = cycle;
+                InputMethodState::Running {
+                    engine   : engine,
+                    engines  : engines,
+                    indicator: indicator,
+                    menu     : menu,
+                }
+            }
+            ImEvent::Properties { indicator: glyph, menu: entries } => {
+                indicator = glyph;
+                menu = entries;
+                InputMethodState::Running {
+                    engine   : engine,
+                    engines  : engines,
+                    indicator: indicator,
+                    menu     : menu,
+                }
+            }
+            // Binding says nothing about the daemon, so everything known
+            // about it is kept: losing the name would blank the status line
+            // for as long as the engine stays unchanged.
             ImEvent::Bound => InputMethodState::Running {
-                engine: match &self.im_state {
-                    InputMethodState::Running { engine } => engine.clone(),
-                    _                                    => None,
-                },
+                engine   : engine,
+                engines  : engines,
+                indicator: indicator,
+                menu     : menu,
             },
             ImEvent::Blocked { reason } => InputMethodState::Blocked { reason: reason },
             ImEvent::Stopped { reason } => InputMethodState::Stopped { reason: reason },

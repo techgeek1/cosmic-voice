@@ -11,9 +11,9 @@
 //! (`src/ibusenginedesc.c`: "you should not change the serialized order …
 //! because the order is also used in other applications likes ibus-qt").
 //!
-//! The five types below are the ones the multiplexer needs. Their layouts were
-//! read out of ibus 1.5.34's `serialize()` implementations rather than guessed
-//! from introspection, because introspection only ever says `v`:
+//! The seven types below are the ones the multiplexer needs. Their layouts
+//! were read out of ibus 1.5.34's `serialize()` implementations rather than
+//! guessed from introspection, because introspection only ever says `v`:
 //!
 //! | type              | signature                    | source                    |
 //! | ----------------- | ---------------------------- | ------------------------- |
@@ -22,13 +22,15 @@
 //! | `IBusAttribute`   | `(sa{sv}uuuu)`               | `src/ibusattribute.c`     |
 //! | `IBusLookupTable` | `(sa{sv}uubbiavav)`          | `src/ibuslookuptable.c`   |
 //! | `IBusEngineDesc`  | `(sa{sv}ssssssssussssssss)`  | `src/ibusenginedesc.c`    |
+//! | `IBusProperty`    | `(sa{sv}suvsvbbuvv)`         | `src/ibusproperty.c`      |
+//! | `IBusPropList`    | `(sa{sv}av)`                 | `src/ibusproplist.c`      |
 //!
-//! `IBusProperty` and `IBusPropList` (the `RegisterProperties` and
-//! `UpdateProperty` signals) are deliberately *not* decoded. They describe the
-//! engine's status-icon menu, which belongs to the panel applet's surface and
-//! not to the IM path; phase 4 can add them when there is something to render
-//! them into. Until then those signals carry their payload through as an
-//! undecoded value.
+//! `IBusProperty` and `IBusPropList` are the `RegisterProperties` and
+//! `UpdateProperty` signals: the engine's status menu, which `ibus-ui-gtk3`
+//! used to draw in the tray and the applet popup draws now (phase 6). They
+//! reach us at all only because `CAP_PROPERTY` is in the context's
+//! capabilities; without it the daemon sends them to the panel service
+//! instead (`bus/inputcontext.c:2544-2551`).
 
 use std::collections::HashMap;
 
@@ -575,6 +577,185 @@ impl std::fmt::Display for EngineDesc {
     }
 }
 
+// --- IBusProperty ---
+
+/// Shown as plain text; activating it is a one-shot action (ibusproperty.h,
+/// `IBusPropType`). mozc's "Dictionary Tool" entries are these.
+pub const PROP_TYPE_NORMAL: u32 = 0;
+/// A check item that is on or off.
+pub const PROP_TYPE_TOGGLE: u32 = 1;
+/// One of a group; exactly one sibling is checked. mozc's input modes.
+pub const PROP_TYPE_RADIO: u32 = 2;
+/// A submenu: its `sub_props` are the entries.
+pub const PROP_TYPE_MENU: u32 = 3;
+/// A line between entries. Carries nothing.
+pub const PROP_TYPE_SEPARATOR: u32 = 4;
+
+/// Off, for a toggle or radio (ibusproperty.h, `IBusPropState`).
+pub const PROP_STATE_UNCHECKED: u32 = 0;
+/// On. Also the state an activation has to *send* for a radio entry: mozc
+/// ignores a `PropertyActivate` on an input mode with any other state
+/// (`unix/ibus/property_handler.cc`, `ProcessPropertyActivate`).
+pub const PROP_STATE_CHECKED: u32 = 1;
+/// Neither, which the panel draws as a dash. Engines rarely use it.
+pub const PROP_STATE_INCONSISTENT: u32 = 2;
+
+/// One entry of an engine's status menu.
+///
+/// Eleven positional fields, and `symbol` comes *last* even though it belongs
+/// with `label`: it was added after `sub_props` and upstream keeps the wire
+/// order frozen ("Keep the serialized order for the compatibility when add new
+/// members", `src/ibusproperty.c:394`). The panel's indicator glyph is the
+/// `symbol` of the property whose `key` matches the engine's `icon_prop_key`
+/// (`ui/gtk3/panel.vala:1790-1795`), which for mozc is `InputMode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Property {
+    /// The engine's name for it, e.g. `InputMode.Hiragana`. What
+    /// `PropertyActivate` takes, and what `UpdateProperty` matches on.
+    pub key      : String,
+    /// One of the `PROP_TYPE_*` constants.
+    pub kind     : u32,
+    /// The text to show for it.
+    pub label    : Text,
+    /// Icon name or path, for panels that draw one. Unused here.
+    pub icon     : String,
+    /// Hover text.
+    pub tooltip  : Text,
+    /// Whether it can be activated.
+    pub sensitive: bool,
+    /// Whether to show it at all.
+    pub visible  : bool,
+    /// One of the `PROP_STATE_*` constants. Meaningful for toggles and radios.
+    pub state    : u32,
+    /// The entries of a `PROP_TYPE_MENU`; empty for everything else.
+    pub sub_props: PropList,
+    /// Short status-area text, e.g. `あ`. Empty for most properties.
+    pub symbol   : Text,
+}
+
+impl Property {
+    /// Every entry in the tree, this one first, then its children in order.
+    ///
+    /// Depth first because that is the order a menu is drawn in and the order
+    /// `UpdateProperty` has to search: an update names a key that can be at
+    /// any depth, and mozc updates its radio children by key.
+    pub fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a Property)) {
+        visit(self);
+        for child in &self.sub_props.properties {
+            child.walk(visit);
+        }
+    }
+}
+
+impl Serializable for Property {
+    const TYPE_NAME: &'static str = "IBusProperty";
+
+    fn encode(&self, builder: StructureBuilder<'static>) -> Result<StructureBuilder<'static>> {
+        // `append_field` for the four `v` fields, for the reason [`Text`]
+        // gives: `add_field` would wrap a variant in another variant.
+        Ok(builder
+            .add_field(self.key.clone())
+            .add_field(self.kind)
+            .append_field(Value::Value(Box::new(self.label.to_value()?)))
+            .add_field(self.icon.clone())
+            .append_field(Value::Value(Box::new(self.tooltip.to_value()?)))
+            .add_field(self.sensitive)
+            .add_field(self.visible)
+            .add_field(self.state)
+            .append_field(Value::Value(Box::new(self.sub_props.to_value()?)))
+            .append_field(Value::Value(Box::new(self.symbol.to_value()?))))
+    }
+
+    fn decode(fields: &[Value<'_>]) -> Result<Self> {
+        Ok(Self {
+            key      : field_str(fields, 2, Self::TYPE_NAME)?,
+            kind     : field_u32(fields, 3, Self::TYPE_NAME)?,
+            label    : Text::from_value(field(fields, 4, Self::TYPE_NAME)?)?,
+            icon     : field_str(fields, 5, Self::TYPE_NAME)?,
+            tooltip  : Text::from_value(field(fields, 6, Self::TYPE_NAME)?)?,
+            sensitive: field_bool(fields, 7, Self::TYPE_NAME)?,
+            visible  : field_bool(fields, 8, Self::TYPE_NAME)?,
+            state    : field_u32(fields, 9, Self::TYPE_NAME)?,
+            sub_props: PropList::from_value(field(fields, 10, Self::TYPE_NAME)?)?,
+            symbol   : Text::from_value(field(fields, 11, Self::TYPE_NAME)?)?,
+        })
+    }
+}
+
+impl std::fmt::Display for Property {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            PROP_TYPE_NORMAL    => "normal",
+            PROP_TYPE_TOGGLE    => "toggle",
+            PROP_TYPE_RADIO     => "radio",
+            PROP_TYPE_MENU      => "menu",
+            PROP_TYPE_SEPARATOR => "separator",
+            _                   => "unknown",
+        };
+        let state = match self.state {
+            PROP_STATE_UNCHECKED    => "",
+            PROP_STATE_CHECKED      => " checked",
+            PROP_STATE_INCONSISTENT => " inconsistent",
+            _                       => " state?",
+        };
+        write!(f, "{} {kind} {:?}{state}", self.key, self.label.text)?;
+        if !self.symbol.text.is_empty() {
+            write!(f, " symbol={}", self.symbol.text)?;
+        }
+        if !self.sensitive {
+            write!(f, " insensitive")?;
+        }
+        if !self.visible {
+            write!(f, " hidden")?;
+        }
+        for child in &self.sub_props.properties {
+            write!(f, "\n    {child}")?;
+        }
+
+        Ok(())
+    }
+}
+
+// --- IBusPropList ---
+
+/// An engine's status menu, or one submenu of it.
+///
+/// What `RegisterProperties` carries, and what a `PROP_TYPE_MENU` property
+/// holds in `sub_props`. The wire form is an `av` of property variants
+/// (`src/ibusproplist.c:71-93`), so a list is a list even when empty — which
+/// is what the daemon sends on focus-out and engine change
+/// (`bus/inputcontext.c:2037`, `:3051`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PropList {
+    /// The entries, in menu order.
+    pub properties: Vec<Property>,
+}
+
+impl Serializable for PropList {
+    const TYPE_NAME: &'static str = "IBusPropList";
+
+    fn encode(&self, builder: StructureBuilder<'static>) -> Result<StructureBuilder<'static>> {
+        Ok(builder.add_field(objects_to_array(&self.properties)?))
+    }
+
+    fn decode(fields: &[Value<'_>]) -> Result<Self> {
+        Ok(Self {
+            properties: field_objects(fields, 2, Self::TYPE_NAME)?,
+        })
+    }
+}
+
+impl std::fmt::Display for PropList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} propert{}", self.properties.len(), if self.properties.len() == 1 { "y" } else { "ies" })?;
+        for property in &self.properties {
+            write!(f, "\n    {property}")?;
+        }
+
+        Ok(())
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -772,5 +953,144 @@ mod tests {
     #[test]
     fn rejects_a_short_structure() {
         assert!(EngineDesc::from_value(&raw("IBusEngineDesc", vec![s("mozc-jp")])).is_err());
+    }
+
+    /// A property with everything but the key, type and label defaulted.
+    fn prop(key: &str, kind: u32, label: &str) -> Property {
+        Property {
+            key      : key.to_string(),
+            kind     : kind,
+            label    : Text::plain(label),
+            icon     : String::new(),
+            tooltip  : Text::default(),
+            sensitive: true,
+            visible  : true,
+            state    : PROP_STATE_UNCHECKED,
+            sub_props: PropList::default(),
+            symbol   : Text::default(),
+        }
+    }
+
+    /// The shape mozc registers (`unix/ibus/property_handler.cc`): an
+    /// `InputMode` menu of radio modes with one checked and the symbol on the
+    /// menu itself, then a `MozcTool` menu of plain actions. The tool keys
+    /// are mozc 3.34's as seen on the wire (`config_dialog`,
+    /// `dictionary_tool`, …); current mozc spells them `Tool.ConfigDialog`.
+    fn mozc_shaped_list() -> PropList {
+        let mut input_mode = prop("InputMode", PROP_TYPE_MENU, "Input Mode (あ)");
+        input_mode.symbol = Text::plain("あ");
+        input_mode.icon = "/usr/share/ibus-mozc/hiragana.png".to_string();
+        let mut hiragana = prop("InputMode.Hiragana", PROP_TYPE_RADIO, "Hiragana");
+        hiragana.state = PROP_STATE_CHECKED;
+        input_mode.sub_props = PropList {
+            properties: vec![
+                prop("InputMode.Direct", PROP_TYPE_RADIO, "Direct input"),
+                hiragana,
+                prop("InputMode.Katakana", PROP_TYPE_RADIO, "Katakana"),
+            ],
+        };
+
+        let mut tool = prop("MozcTool", PROP_TYPE_MENU, "Tools");
+        tool.sub_props = PropList {
+            properties: vec![
+                prop("config_dialog", PROP_TYPE_NORMAL, "Properties"),
+                prop("dictionary_tool", PROP_TYPE_NORMAL, "Dictionary Tool"),
+            ],
+        };
+
+        PropList {
+            properties: vec![input_mode, tool],
+        }
+    }
+
+    #[test]
+    fn property_round_trips() {
+        let mut original = prop("InputMode.Hiragana", PROP_TYPE_RADIO, "Hiragana");
+        original.icon = "hiragana.png".to_string();
+        original.tooltip = Text::plain("Type in hiragana");
+        original.sensitive = false;
+        original.visible = false;
+        original.state = PROP_STATE_INCONSISTENT;
+        original.symbol = Text::plain("あ");
+        assert_eq!(roundtrip(&original), original);
+    }
+
+    #[test]
+    fn empty_prop_list_round_trips() {
+        assert_eq!(roundtrip(&PropList::default()), PropList::default());
+    }
+
+    /// A nested list survives the trip with its structure intact, which is the
+    /// case the `v` fields make interesting: `sub_props` is a variant holding
+    /// a structure holding an array of variants.
+    #[test]
+    fn mozc_shaped_list_round_trips() {
+        let original = mozc_shaped_list();
+        let decoded = roundtrip(&original);
+        assert_eq!(decoded, original);
+
+        let input_mode = &decoded.properties[0];
+        assert_eq!(input_mode.key, "InputMode");
+        assert_eq!(input_mode.kind, PROP_TYPE_MENU);
+        assert_eq!(input_mode.symbol.text, "あ");
+        assert_eq!(input_mode.sub_props.properties.len(), 3);
+        assert_eq!(input_mode.sub_props.properties[1].state, PROP_STATE_CHECKED);
+        assert_eq!(input_mode.sub_props.properties[0].state, PROP_STATE_UNCHECKED);
+        assert_eq!(decoded.properties[1].sub_props.properties[1].key, "dictionary_tool");
+    }
+
+    /// The wire layout keyed in by hand from `ibus_property_serialize`
+    /// (`src/ibusproperty.c:362-401`), with `symbol` in its eleventh slot
+    /// after `sub_props`. A round trip alone would pass with the two swapped.
+    #[test]
+    fn decodes_the_upstream_property_layout() {
+        let text = |value: &str| Value::Value(Box::new(Text::plain(value).to_value().expect("text")));
+        let list = Value::Value(Box::new(PropList::default().to_value().expect("list")));
+        let value = raw(
+            "IBusProperty",
+            vec![
+                s("InputMode"),
+                Value::U32(PROP_TYPE_MENU),
+                text("Input Mode (A)"),
+                s("direct.png"),
+                text(""),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::U32(PROP_STATE_UNCHECKED),
+                list,
+                text("A"),
+            ],
+        );
+
+        let property = Property::from_value(&value).expect("decode the upstream layout");
+        assert_eq!(property.key, "InputMode");
+        assert_eq!(property.kind, PROP_TYPE_MENU);
+        assert_eq!(property.label.text, "Input Mode (A)");
+        assert_eq!(property.icon, "direct.png");
+        assert_eq!(property.symbol.text, "A");
+        assert!(property.sub_props.properties.is_empty());
+    }
+
+    /// Depth first, parent before children, siblings in order: the order a
+    /// menu is drawn in.
+    #[test]
+    fn walks_the_tree_depth_first() {
+        let list = mozc_shaped_list();
+        let mut keys = Vec::new();
+        for property in &list.properties {
+            property.walk(&mut |property| keys.push(property.key.as_str()));
+        }
+        assert_eq!(
+            keys,
+            [
+                "InputMode",
+                "InputMode.Direct",
+                "InputMode.Hiragana",
+                "InputMode.Katakana",
+                "MozcTool",
+                "config_dialog",
+                "dictionary_tool",
+            ]
+        );
     }
 }

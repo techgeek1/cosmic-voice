@@ -18,26 +18,11 @@
 //! the bottom of this file are the phase-5 regression that runs on `cargo
 //! test`.
 //!
-//! The rest is the plumbing that gets a [`DictationCmd`] from the engine's
-//! tokio loop onto the frontend's calloop loop without either being able to
-//! block the other, and the one fact travelling the other way.
-//!
-//! # Why the answer is an atomic and not a reply
-//!
-//! The engine has to choose between the input-method path and the virtual
-//! keyboard at the moment it wants to show or commit text, and it must not
-//! wait for the answer: its loop also drives audio capture. A request/reply
-//! over a channel would either block it or hand it an answer that was already
-//! stale by the time it arrived. So the frontend *publishes* the fact instead
-//! — [`ImStatus`] is written on every activation change and read whenever the
-//! engine is about to speak — and the residual race (the field goes away in
-//! the microseconds between the read and the send) is resolved by
-//! [`advance`] on the other side, which sees the current value.
+//! The plumbing that gets a [`DictationCmd`] from the engine's tokio loop
+//! onto the frontend's calloop loop, and the one fact travelling the other
+//! way, is [`super::command`]: the same road now carries the popup's engine
+//! switch and menu activations, so it is no longer dictation's alone.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-use calloop::channel::Sender;
 use serde::{Deserialize, Serialize};
 
 // --- The commands ---
@@ -45,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// What the dictation engine asks the input method to do.
 ///
 /// Serialisable because the harness feeds these in from a shell script through
-/// a fifo (`devtest im-frontend --dictation-fifo`), which is what lets the
+/// a fifo (`devtest im-frontend --control-fifo`), which is what lets the
 /// turn-taking be tested end to end against a real mozc without a microphone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DictationCmd {
@@ -67,8 +52,8 @@ pub enum DictationCmd {
 ///
 /// One per activation in the design; in practice one per process, because a
 /// deactivation while dictating is not a reason to throw an utterance away —
-/// the engine notices the field is gone from [`ImStatus`] and finishes on the
-/// virtual keyboard instead.
+/// the engine notices the field is gone from [`super::command::ImStatus`] and
+/// finishes on the virtual keyboard instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Turn {
     /// Keys go to IBus, its preedit and commits go to the application. The
@@ -117,7 +102,8 @@ pub enum Op {
 ///    entering dictation mid-word costs the user nothing. With no field
 ///    focused there is nothing to finish and nothing to reset — and no preedit
 ///    to show either, so the router stays in `Forwarding` and the engine,
-///    reading the same [`ImStatus`], types on the virtual keyboard instead.
+///    reading the same [`super::command::ImStatus`], types on the virtual
+///    keyboard instead.
 /// 2. **A partial is only ever a preedit, and only while dictating.** One that
 ///    arrives in `Forwarding` is a command that raced its `Begin` past a focus
 ///    change; showing it would put voice text into a preedit the keyboard
@@ -148,112 +134,6 @@ pub fn advance(state: Turn, command: &DictationCmd, active: bool) -> (Turn, Vec<
             (Turn::Forwarding, vec![Op::Preedit(String::new())])
         }
         (Turn::Forwarding, DictationCmd::Cancel, _) => (Turn::Forwarding, Vec::new()),
-    }
-}
-
-// --- The link ---
-
-/// What the frontend publishes about itself, for the engine to read.
-///
-/// Two flags rather than one because they fail differently: `bound` says a
-/// frontend exists at all (it is false while the supervisor is backing off
-/// after a crash, and while the input method is blocked), and `active` says a
-/// text-input client has focus. The engine needs both to be true before the
-/// input-method path is worth anything.
-#[derive(Debug, Default)]
-pub struct ImStatus {
-    /// Whether a frontend is running and holds the input-method slot.
-    bound : AtomicBool,
-    /// Whether a text-input client is focused right now.
-    active: AtomicBool,
-}
-
-impl ImStatus {
-    /// Whether dictation can go through the input method at this instant.
-    ///
-    /// `Relaxed` throughout: there is no other memory being published
-    /// alongside these flags, the writer is one thread and the reader is one
-    /// thread, and a read that is one activation out of date is resolved by
-    /// [`advance`] at the other end.
-    pub fn is_active(&self) -> bool {
-        self.bound.load(Ordering::Relaxed) && self.active.load(Ordering::Relaxed)
-    }
-
-    /// Records whether a frontend holds the slot. Called by the supervisor.
-    pub fn set_bound(&self, bound: bool) {
-        self.bound.store(bound, Ordering::Relaxed);
-        if !bound {
-            self.active.store(false, Ordering::Relaxed);
-        }
-    }
-
-    /// Records whether a text field has focus. Called by the frontend on every
-    /// applied activation change.
-    pub fn set_active(&self, active: bool) {
-        self.active.store(active, Ordering::Relaxed);
-    }
-}
-
-/// The engine's end of the connection to the input-method thread.
-///
-/// Cloneable and outlives any one frontend: the sender inside is *replaced*
-/// each time the supervisor starts a frontend, because a calloop channel
-/// belongs to the loop that polls it and a restarted loop is a new one. The
-/// engine holds this from process start and never learns that a restart
-/// happened — its sends go nowhere while `commands` is empty, which is exactly
-/// what "the input method is not available" already means to it.
-#[derive(Debug, Clone, Default)]
-pub struct DictationLink {
-    /// The running frontend's command channel, if one is running. The mutex is
-    /// uncontended except at the instant of a restart; the alternative, a
-    /// permanent channel plus a thread forwarding into a per-loop one, buys
-    /// nothing but a thread.
-    commands: Arc<Mutex<Option<Sender<DictationCmd>>>>,
-    /// What the frontend says about itself.
-    status  : Arc<ImStatus>,
-}
-
-impl DictationLink {
-    /// A link with no frontend behind it yet.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The status flags, for the frontend and the supervisor to write.
-    pub fn status(&self) -> &Arc<ImStatus> {
-        &self.status
-    }
-
-    /// Whether dictation should use the input-method path right now.
-    pub fn is_active(&self) -> bool {
-        self.status.is_active()
-    }
-
-    /// Points the link at a freshly started frontend's channel.
-    pub fn attach(&self, sender: Sender<DictationCmd>) {
-        *self.commands.lock().expect("the dictation link mutex is never poisoned") = Some(sender);
-    }
-
-    /// Forgets the frontend's channel, after it stopped.
-    pub fn detach(&self) {
-        *self.commands.lock().expect("the dictation link mutex is never poisoned") = None;
-    }
-
-    /// Sends one command, dropping it if no frontend is running.
-    ///
-    /// Never blocks and never fails upwards: a calloop channel is unbounded,
-    /// and a send that fails means the loop it belonged to is gone, which the
-    /// engine already handles by falling back to the virtual keyboard.
-    pub fn send(&self, command: DictationCmd) {
-        let mut slot = self.commands.lock().expect("the dictation link mutex is never poisoned");
-        let Some(sender) = slot.as_ref() else {
-            tracing::debug!("dropping {command:?}: no input-method frontend is running");
-            return;
-        };
-        if sender.send(command).is_err() {
-            tracing::debug!("the input-method frontend stopped reading dictation commands");
-            *slot = None;
-        }
     }
 }
 
@@ -385,23 +265,5 @@ mod tests {
         let (state, ops) = advance(Turn::Forwarding, &DictationCmd::Cancel, true);
         assert_eq!(state, Turn::Forwarding);
         assert!(ops.is_empty());
-    }
-
-    /// The status flags are two conditions, not one: a frontend that is
-    /// backing off after a crash is not usable even if the last thing it saw
-    /// was an active field.
-    #[test]
-    fn status_needs_both_flags() {
-        let status = ImStatus::default();
-        assert!(!status.is_active());
-        status.set_bound(true);
-        assert!(!status.is_active());
-        status.set_active(true);
-        assert!(status.is_active());
-        // Losing the frontend clears the activation with it, so a restarted
-        // one cannot inherit a stale `true`.
-        status.set_bound(false);
-        status.set_bound(true);
-        assert!(!status.is_active());
     }
 }

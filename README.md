@@ -99,6 +99,16 @@ registration is a last-writer-wins global with no unregister, and the daemon
 broadcasts the response to every subscriber, so two panels would fight over
 one hotkey.
 
+`im/properties.rs` and the popup's "Input method" section are the rest of
+what `ibus-ui-gtk3` did: the tray glyph and the menu behind it. The engine's
+status menu (`RegisterProperties`, `UpdateProperty`) is routed by the daemon
+on one capability bit, not by who the panel is, so with `CAP_PROPERTY` on
+our context mozc's input modes and tools arrive on the connection we already
+hold and `PropertyActivate` goes straight to the engine. The applet draws the
+current mode's glyph beside the microphone on the panel, and the popup lists
+the engine cycle and the menu as radio rows, togglers and buttons. There is
+deliberately no tray icon and no `org.freedesktop.IBus.Panel` service.
+
 `im/dictation.rs` is the turn-taking the whole thing exists for. When the
 trigger goes down the engine sends a `Begin`: whatever conversion mozc had in
 progress is *committed* into the field rather than discarded — the preedit is
@@ -113,15 +123,19 @@ virtual keyboard, and nothing is committed into whichever window took focus.
 `engine.rs` never learns any of that. It hands text to a `TextSink` (`sink.rs`)
 which either sends a command down a channel to the input-method thread or falls
 back to the virtual keyboard, choosing between them by reading one flag that
-thread publishes; neither side ever blocks on the other. `im/supervisor.rs`
+thread publishes; neither side ever blocks on the other. The same channel
+(`im/command.rs`) carries the popup's engine switch and menu activations, and
+`cosmic-voice engine <id>` / `cosmic-voice property <key> [state]` drive them
+from scripts. `im/supervisor.rs`
 keeps the thread alive — a frontend that dies restarts with a backoff, and the
 applet popup says so meanwhile, because an input method that silently is not
 there looks exactly like one that is.
 
 The routing rules are a pure function in `im/router.rs` with unit tests, which
 is the part that can be checked without a compositor; the turn-taking in
-`im/dictation.rs`, and accelerator parsing and the cycle arithmetic in
-`im/switcher.rs`, are the same. The rest is checked by
+`im/dictation.rs`, the status-menu model in `im/properties.rs`, and
+accelerator parsing and the cycle arithmetic in `im/switcher.rs`, are the
+same. The rest is checked by
 `scripts/im-harness/frontend-test.sh`, which starts a nested cosmic-comp, an
 isolated ibus-daemon with mozc, a GTK entry and the frontend, injects keys over
 libei, and asserts that `konnnitiha` comes out of the entry as こんにちは, that
@@ -134,8 +148,12 @@ that a plausibly sized buffer was attached, and that the window went away on
 commit. `scripts/im-harness/switcher-test.sh` does
 the same for the panel duties: it injects Ctrl+Alt+Space and asserts that the
 engine toggles both ways, that the Shift-modified trigger comes back flagged
-backward, and that mozc converts afterwards. None of it touches the live
-session.
+backward, and that mozc converts afterwards. `scripts/im-harness/property-test.sh`
+does it for the status menu: mozc's `InputMode` menu arrives on our context,
+the glyph is あ, activating `InputMode.Direct` turns it into `A` and makes
+`konnnitiha` arrive as ASCII, hiragana converts again, and switching to
+`xkb:us::eng` and back empties and refills the menu. None of it touches the
+live session.
 
 Three hidden devtests exercise the two legs. `cosmic-voice devtest ibus-info`
 is read-only — it connects, decodes the engine registry and reports what the
@@ -150,9 +168,10 @@ cosmic-comp, it wedges the keyboard session-wide, so the display is named
 explicitly and the live one has to be asked for with `--live-i-know`. Point it
 at a nested compositor. `--config <path>` gives it a config file other than the
 user's, which is how the harness pins the engine-switch trigger and the engine
-cycle to known values, and `--dictation-fifo <path>` reads newline-delimited
-JSON dictation commands off a fifo, which is how a shell script drives
-turn-taking with no microphone in the loop.
+cycle to known values, and `--control-fifo <path>` reads newline-delimited
+JSON commands off a fifo — dictation, engine switches, menu activations —
+which is how a shell script drives turn-taking and the status menu with no
+microphone and no panel in the loop.
 
 ## Setup
 
@@ -235,7 +254,14 @@ Then, by hand, in this order:
    **Voice** from the panel and add it again through COSMIC's applet settings,
    or log out and back in.
 4. Check the popup. `Ready — hold F13 to talk · Mozc あ` means the multiplexer
-   is running and IBus has told it which engine is in effect;
+   is running and IBus has told it which engine is in effect — the あ is the
+   live input mode, and it also sits beside the microphone on the panel
+   itself. Below the switches, an **Input method** section lists the engines
+   the hotkey cycles through (press one to switch) and, for mozc, its
+   **Input Mode** radios and **Tools**: this is the menu that used to hang off
+   `ibus-ui-gtk3`'s tray icon. The tray icon itself is gone on purpose: the
+   applet is the panel presence now, and nothing owns
+   `org.freedesktop.IBus.Panel`.
    `Input method: blocked — …` means step 2 did not take (redo it, the applet
    notices within seconds and needs no restart); `Input method: not running —
    …` names the reason the frontend failed. Then type into a text field —
@@ -266,8 +292,8 @@ Killing either holder is enough, because a grab is released by its object's
 destructor and the object dies with the process. If the VT switch does not
 work either, ssh in from another machine and run the same two `pkill`s.
 
-The popup has two switches and a key. **Dictation** arms or disarms the
-trigger. **Log transcripts** appends every committed utterance as a JSON line
+The popup has two switches, a key, and the input-method section below them.
+**Dictation** arms or disarms the trigger. **Log transcripts** appends every committed utterance as a JSON line
 to `~/.local/share/cosmic-voice/transcripts.jsonl`, raw from the recogniser,
 as a corpus for evaluating a cleanup pass; logging starts off unless
 `log_transcripts: true` is set in the config, and `cosmic-voice log on|off`
@@ -299,6 +325,8 @@ rest mirror it, so every panel icon works and nothing runs multiplied.
 | `ibus/`        | D-Bus client for ibus-daemon, the multiplexer's upstream leg |
 | `im/`          | Wayland input-method frontend, the multiplexer's downstream leg |
 | `im/dictation.rs` | turn-taking between the keyboard and the microphone |
+| `im/command.rs` | the one channel into the input-method thread: dictation, engine switches, menu activations |
+| `im/properties.rs` | the engine's status menu and mode glyph, as the popup draws them |
 | `im/supervisor.rs` | keeping the input-method thread alive inside the applet |
 | `im/switcher.rs` + `ibus/panel.rs` | the IBus panel duties: engine-switch trigger and engine cycle |
 | `im/popup.rs`  | the candidate window's surface, shm buffers and lookup-table state |

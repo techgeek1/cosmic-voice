@@ -22,7 +22,11 @@
 //! - [`router`] — the routing rules, as a pure function with tests. The only
 //!   part of the leg that can be checked without a compositor.
 //! - [`dictation`] — turn-taking between the keyboard and the microphone, as a
-//!   second pure function with tests, plus the channel that carries it.
+//!   second pure function with tests.
+//! - [`command`] — the channel that carries dictation, engine switches and
+//!   menu activations into the loop, and the status flags travelling back.
+//! - [`properties`] — the engine's status menu and mode glyph, as a third pure
+//!   model with tests; what the applet popup's "Input method" section draws.
 //! - [`supervisor`] — keeping a frontend running inside the applet process,
 //!   and telling the applet when there is not one.
 //! - [`link`] — when to build an IBus context, and how its asynchronous signals
@@ -40,9 +44,11 @@
 //!
 //! [`crate::engine`] never speaks Wayland. It hands text to a
 //! [`crate::sink::TextSink`], which either sends a [`dictation::DictationCmd`]
-//! down the link to this thread or falls back to [`crate::inject`]'s virtual
-//! keyboard, and it chooses between them by reading one flag this thread
-//! publishes. Nothing on either side ever blocks on the other.
+//! down the [`command::ImLink`] to this thread or falls back to
+//! [`crate::inject`]'s virtual keyboard, and it chooses between them by
+//! reading one flag this thread publishes. Nothing on either side ever blocks
+//! on the other. The popup's engine switch and menu activations take the same
+//! link, as [`command::ImCmd`]s.
 //!
 //! # Safety
 //!
@@ -64,19 +70,22 @@
 //! before every attempt, and the fact that the mode has to be written into the
 //! config by hand after the autostart cutover.
 
+mod command;
 mod content_type;
 mod dictation;
 mod frontend;
 mod keyboard;
 mod link;
 mod popup;
+mod properties;
 mod render;
 mod router;
 mod supervisor;
 mod switcher;
 mod theme;
 
-pub use dictation::{DictationCmd, DictationLink};
+pub use command::{ImCmd, ImLink};
+pub use dictation::DictationCmd;
 pub use frontend::{Options, run};
 pub use supervisor::{Supervised, spawn};
 pub use switcher::ImEvent;

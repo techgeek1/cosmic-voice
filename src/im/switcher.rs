@@ -55,9 +55,11 @@ use xkbcommon::xkb;
 
 use super::link::Upstream;
 use crate::ibus::{
-    Address, BINDING_TYPE_IME_SWITCHER, CONTROL_MASK, MOD1_MASK, MOD2_MASK, MOD3_MASK, MOD4_MASK,
-    MOD5_MASK, MODIFIER_FILTER, Panel, PanelSignal, PanelStream, RELEASE_MASK, SHIFT_MASK, Shortcut,
+    Address, BINDING_TYPE_IME_SWITCHER, CONTROL_MASK, EngineDesc, MOD1_MASK, MOD2_MASK, MOD3_MASK,
+    MOD4_MASK, MOD5_MASK, MODIFIER_FILTER, Panel, PanelSignal, PanelStream, RELEASE_MASK,
+    SHIFT_MASK, Shortcut,
 };
+use crate::ipc::{ImEngine, ImProperty};
 
 /// How long to wait before trying a daemon that was not there again.
 ///
@@ -77,23 +79,27 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// frontend logs every one of them at info whether or not anybody is
 /// listening, so the trace is complete even with no receiver attached.
 ///
-/// Two producers: this module, which knows which engine is in effect, and
-/// [`super::supervisor`], which knows whether a frontend is running at all.
-/// One consumer — the dictation engine — folds both into the single
-/// [`crate::ipc::InputMethodState`] the panel popup renders, which is why they
-/// share one channel rather than having one each.
+/// Three producers: this module, which knows which engine is in effect and
+/// which ones the cycle holds; [`super::frontend`], which holds the engine's
+/// status menu; and [`super::supervisor`], which knows whether a frontend is
+/// running at all. One consumer — the dictation engine — folds all of it into
+/// the single [`crate::ipc::InputMethodState`] the panel popup renders, which
+/// is why they share one channel rather than having one each.
 #[derive(Debug, Clone)]
 pub enum ImEvent {
     /// The global input engine changed. Emitted on our own switches and on
     /// anybody else's, because the daemon does not distinguish and the panel
     /// applet wants to show what is actually in effect.
-    EngineChanged {
-        /// Engine id, e.g. `mozc-jp`.
-        name    : String,
-        /// Short status-area symbol, e.g. `あ`. Often empty for xkb engines.
-        symbol  : String,
-        /// Human-readable name, e.g. `Mozc`.
-        longname: String,
+    EngineChanged(ImEngine),
+    /// The engines the switch hotkey cycles through, described. Emitted once
+    /// per panel connection, since that is when the cycle is resolved.
+    Engines(Vec<ImEngine>),
+    /// The engine's status menu changed, or the glyph did.
+    Properties {
+        /// The mode glyph, if the engine has one.
+        indicator: Option<String>,
+        /// The menu, top level down.
+        menu     : Vec<ImProperty>,
     },
     /// The frontend bound the seat's input-method slot and is running.
     Bound,
@@ -116,16 +122,27 @@ pub enum ImEvent {
 impl std::fmt::Display for ImEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ImEvent::EngineChanged { name, symbol, longname } => {
-                write!(f, "engine {name}")?;
-                if !longname.is_empty() && longname != name {
-                    write!(f, " ({longname})")?;
+            ImEvent::EngineChanged(engine) => {
+                write!(f, "engine {}", engine.name)?;
+                if !engine.longname.is_empty() && engine.longname != engine.name {
+                    write!(f, " ({})", engine.longname)?;
                 }
-                if !symbol.is_empty() {
-                    write!(f, " [{symbol}]")?;
+                if !engine.symbol.is_empty() {
+                    write!(f, " [{}]", engine.symbol)?;
                 }
                 Ok(())
             }
+            ImEvent::Engines(engines) => {
+                let names: Vec<&str> = engines.iter().map(|engine| engine.name.as_str()).collect();
+                write!(f, "engine cycle {names:?}")
+            }
+            ImEvent::Properties { indicator, menu } => write!(
+                f,
+                "properties: indicator {}, {} menu entr{}",
+                indicator.as_deref().unwrap_or("-"),
+                menu.len(),
+                if menu.len() == 1 { "y" } else { "ies" },
+            ),
             ImEvent::Bound              => write!(f, "input method bound"),
             ImEvent::Blocked { reason } => write!(f, "input method blocked: {reason}"),
             ImEvent::Stopped { reason } => write!(f, "input method stopped: {reason}"),
@@ -379,6 +396,39 @@ pub fn dconf_engines() -> Vec<String> {
 
 // --- The switcher ---
 
+/// What the registry said about one engine, kept so a switch does not cost a
+/// round trip and so the frontend can find the indicator property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Described {
+    /// Short status-area symbol, e.g. `あ`. Empty for xkb engines.
+    symbol       : String,
+    /// Human-readable name, e.g. `Mozc`.
+    longname     : String,
+    /// The key of the property whose `symbol` is the mode glyph. Empty when
+    /// the engine has none, which is every xkb engine.
+    icon_prop_key: String,
+}
+
+impl Described {
+    /// The part of an engine description worth keeping.
+    fn from_desc(desc: &EngineDesc) -> Self {
+        Self {
+            symbol       : desc.symbol.clone(),
+            longname     : desc.longname.clone(),
+            icon_prop_key: desc.icon_prop_key.clone(),
+        }
+    }
+
+    /// The serde form, for the applet.
+    fn to_ipc(&self, name: &str) -> ImEngine {
+        ImEngine {
+            name    : name.to_string(),
+            symbol  : self.symbol.clone(),
+            longname: self.longname.clone(),
+        }
+    }
+}
+
 /// The panel connection, the trigger registration and the engine cycle.
 ///
 /// Shaped like [`super::link::Link`] on purpose: `ensure` on a retry clock,
@@ -407,9 +457,9 @@ pub struct Switcher {
     /// each one, so editing dconf and restarting ibus-daemon is enough to pick
     /// up a new list.
     engines         : Vec<String>,
-    /// Display names and symbols for the engines we have looked up, so a
-    /// switch does not cost a registry round trip.
-    described       : HashMap<String, (String, String)>,
+    /// What the registry said about the engines we have looked up, so a
+    /// switch does not cost a round trip.
+    described       : HashMap<String, Described>,
     /// The engine the daemon last told us about.
     current         : Option<String>,
     /// When the next connection attempt may happen. `None` means "now".
@@ -541,8 +591,71 @@ impl Switcher {
         self.panel = Some(panel);
 
         self.choose_engine_if_none();
+        self.publish(ImEvent::Engines(self.cycle()));
 
         Ok(())
+    }
+
+    /// The key of the current engine's indicator property, or an empty string
+    /// when it has none or nothing is known yet.
+    pub fn icon_prop_key(&self) -> &str {
+        self.current
+            .as_ref()
+            .and_then(|name| self.described.get(name))
+            .map_or("", |described| described.icon_prop_key.as_str())
+    }
+
+    /// Switches to a named engine, on request rather than by hotkey.
+    ///
+    /// The same call the trigger makes, with the same contract: nothing here
+    /// records the switch, `GlobalEngineChanged` does. A name outside the
+    /// cycle is passed through — the daemon knows its registry better than
+    /// the config file does, and refuses what it does not have.
+    pub fn set_engine(&self, name: &str) {
+        let Some(panel) = self.panel.as_ref() else {
+            tracing::warn!("cannot switch to {name}: no ibus panel connection");
+            return;
+        };
+        tracing::info!(
+            "engine switch requested: {} -> {name}",
+            self.current.as_deref().unwrap_or("unknown")
+        );
+        if let Err(e) = panel.set_global_engine(name) {
+            tracing::warn!("could not switch to {name}: {e}");
+        }
+    }
+
+    /// The cycle, described, in cycle order. An engine the registry did not
+    /// know is listed by name alone rather than dropped, so the popup shows
+    /// what the config says and the log has already said why it will not
+    /// switch.
+    fn cycle(&self) -> Vec<ImEngine> {
+        self.engines
+            .iter()
+            .map(|name| match self.described.get(name) {
+                Some(described) => described.to_ipc(name),
+                None            => ImEngine {
+                    name    : name.clone(),
+                    symbol  : String::new(),
+                    longname: name.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// Sends one event to whoever is listening, forgetting them once they are
+    /// gone. The log line is the record either way.
+    ///
+    /// `pub(super)` because the channel is the frontend's one road to the
+    /// applet and this is where its sending end lives; the frontend's
+    /// property snapshots go through here too.
+    pub(super) fn publish(&mut self, event: ImEvent) {
+        tracing::info!("ibus {event}");
+        if let Some(events) = self.events.as_ref()
+            && events.send(event).is_err()
+        {
+            self.events = None;
+        }
     }
 
     /// Gives a daemon that has no global engine the head of the cycle.
@@ -597,10 +710,8 @@ impl Switcher {
 
         self.described.clear();
         for engine in &described {
-            self.described.insert(
-                engine.name.clone(),
-                (engine.symbol.clone(), engine.longname.clone()),
-            );
+            self.described
+                .insert(engine.name.clone(), Described::from_desc(engine));
         }
         for name in &self.engines {
             if !self.described.contains_key(name) {
@@ -676,33 +787,22 @@ impl Switcher {
             match panel.describe_engine(&name) {
                 Ok(Some(engine)) => {
                     self.described
-                        .insert(name.clone(), (engine.symbol, engine.longname));
+                        .insert(name.clone(), Described::from_desc(&engine));
                 }
                 Ok(None) => tracing::debug!("the registry does not know engine {name:?}"),
                 Err(e)   => tracing::debug!("describing engine {name:?}: {e}"),
             }
         }
 
-        let (symbol, longname) = self
-            .described
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| (String::new(), name.clone()));
-        let event = ImEvent::EngineChanged {
-            name    : name,
-            symbol  : symbol,
-            longname: longname,
+        let engine = match self.described.get(&name) {
+            Some(described) => described.to_ipc(&name),
+            None            => ImEngine {
+                name    : name.clone(),
+                symbol  : String::new(),
+                longname: name,
+            },
         };
-
-        tracing::info!("ibus {event}");
-
-        if let Some(events) = self.events.as_ref() {
-            // A closed receiver means whoever wanted these has gone; the log
-            // line above is still the record.
-            if events.send(event).is_err() {
-                self.events = None;
-            }
-        }
+        self.publish(ImEvent::EngineChanged(engine));
     }
 
     /// Tears the panel connection down after the daemon went away.

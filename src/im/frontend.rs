@@ -53,14 +53,29 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 
 use super::ImEvent;
+use super::command::{ImCmd, ImLink};
 use super::content_type::ContentType;
-use super::dictation::{self, DictationCmd, DictationLink, Op, Turn};
+use super::dictation::{self, DictationCmd, Op, Turn};
 use super::keyboard::{Keyboard, RepeatInfo, XKB_KEYCODE_OFFSET};
 use super::link::{Link, Upstream};
 use super::popup::Popup;
+use super::properties::Properties;
 use super::router::{self, KeyFacts, Route};
 use super::switcher::Switcher;
-use crate::ibus::{ContextSignal, PREEDIT_COMMIT, PostRecord, RELEASE_MASK, Text, describe_state};
+use crate::ibus::{
+    ContextSignal, PREEDIT_COMMIT, PanelSignal, PostRecord, RELEASE_MASK, Text, describe_state,
+};
+
+/// How long a menu change waits for the rest of its burst before the
+/// snapshot goes out.
+///
+/// A mode change is one `UpdateProperty` per radio child and then the menu
+/// itself, each its own engine round trip and so its own wake-up of this
+/// loop — the post-dispatch coalescing the candidate window uses sees them
+/// one at a time (measured: seven snapshots per mode change, ~130µs apart).
+/// Twenty milliseconds covers the burst with room to spare and is well under
+/// anything a person notices on a panel.
+const MENU_SETTLE: Duration = Duration::from_millis(20);
 
 /// How often the loop wakes up when it has nothing else to do.
 ///
@@ -95,14 +110,15 @@ pub struct Options {
     /// dictation engine's tokio loop: a bounded channel would let a busy
     /// applet stall the loop that is servicing the keyboard grab.
     pub events      : Option<tokio::sync::mpsc::UnboundedSender<ImEvent>>,
-    /// The dictation engine's end of the turn-taking channel. `None` means
-    /// nothing dictates through this frontend, which is what a harness run
-    /// without `--dictation-fifo` is.
+    /// The process's end of the command channel: dictation, engine switches
+    /// and menu activations. `None` means nothing outside this thread will
+    /// ask for any of them, which is what a harness run without
+    /// `--control-fifo` is.
     ///
     /// The frontend creates the channel — a calloop channel belongs to the
     /// loop that polls it — and hands the sending end back through this link,
-    /// which outlives any one frontend. See [`super::dictation`].
-    pub dictation   : Option<DictationLink>,
+    /// which outlives any one frontend. See [`super::command`].
+    pub link        : Option<ImLink>,
 }
 
 // --- State ---
@@ -242,9 +258,16 @@ pub struct Frontend {
 
     /// Whose turn it is: the keyboard's, or the microphone's.
     turn        : Turn,
-    /// The dictation engine's link, so activation changes can be published to
-    /// it. `None` when nothing dictates through this frontend.
-    dictation   : Option<DictationLink>,
+    /// The command link, so activation changes can be published to the
+    /// engine. `None` when nothing outside this thread sends commands.
+    commands    : Option<ImLink>,
+    /// The engine's status menu and mode glyph, fed from the context's
+    /// signals and published to the applet whenever it changes.
+    properties  : Properties,
+    /// Whether a snapshot of the menu is already scheduled. The applet wants
+    /// the end of a burst of updates, not every step of it, so the first
+    /// change starts a [`MENU_SETTLE`] timer and the rest ride on it.
+    menu_pending: bool,
 
     /// For scheduling repeat timers.
     handle      : LoopHandle<'static, Frontend>,
@@ -384,7 +407,9 @@ pub fn run(options: Options) -> Result<()> {
         ),
         signals     : sender,
         turn        : Turn::default(),
-        dictation   : options.dictation.clone(),
+        commands    : options.link.clone(),
+        properties  : Properties::new(),
+        menu_pending: false,
         handle      : handle.clone(),
         stop        : event_loop.get_signal(),
     };
@@ -406,19 +431,19 @@ pub fn run(options: Options) -> Result<()> {
         })
         .map_err(|e| anyhow!("registering the tick timer: {e}"))?;
 
-    // The engine's commands. Created here rather than by the caller because a
-    // calloop channel is owned by the loop that polls it, and the loop is
-    // this one; the link the caller passed is how the sending end gets back
-    // out to a thread that outlives this loop.
-    if let Some(link) = options.dictation.as_ref() {
-        let (commands, receiver) = channel::channel::<DictationCmd>();
+    // The commands from the rest of the process. Created here rather than by
+    // the caller because a calloop channel is owned by the loop that polls
+    // it, and the loop is this one; the link the caller passed is how the
+    // sending end gets back out to a thread that outlives this loop.
+    if let Some(link) = options.link.as_ref() {
+        let (commands, receiver) = channel::channel::<ImCmd>();
         handle
             .insert_source(receiver, |event, _, frontend| {
                 if let channel::Event::Msg(command) = event {
-                    frontend.on_dictation(command);
+                    frontend.on_command(command);
                 }
             })
-            .map_err(|e| anyhow!("registering the dictation channel: {e}"))?;
+            .map_err(|e| anyhow!("registering the command channel: {e}"))?;
         link.attach(commands);
         link.status().set_bound(true);
     }
@@ -445,7 +470,7 @@ pub fn run(options: Options) -> Result<()> {
     // input method behind it before this function returns: the supervisor's
     // next attempt is a *new* loop with a new channel, and a stale sender
     // would swallow an utterance in the gap.
-    if let Some(link) = options.dictation.as_ref() {
+    if let Some(link) = options.link.as_ref() {
         link.status().set_bound(false);
         link.detach();
     }
@@ -527,7 +552,7 @@ impl Frontend {
         // dictation engine reads to choose between the preedit path and the
         // virtual keyboard, and it must never claim a field we have already
         // lost. See [`super::dictation`].
-        if let Some(link) = self.dictation.as_ref() {
+        if let Some(link) = self.commands.as_ref() {
             link.status().set_active(self.active);
         }
         self.surrounding = self.pending.surrounding.clone();
@@ -856,7 +881,11 @@ impl Frontend {
             }
             Upstream::Panel(signal)  => {
                 tracing::info!("  panel {signal}");
+                let engine_changed = matches!(signal, PanelSignal::GlobalEngineChanged { .. });
                 self.switcher.on_signal(signal);
+                if engine_changed {
+                    self.on_engine_changed();
+                }
                 return;
             }
             Upstream::PanelLost      => {
@@ -882,9 +911,16 @@ impl Frontend {
                 self.wants_around = true;
                 self.push_surrounding();
             }
-            // Candidates, auxiliary text and engine properties. The candidate
-            // window takes what it recognises and drops the rest; engine
-            // properties are phase 4's.
+            ContextSignal::RegisterProperties(list) => self.on_register_properties(list),
+            ContextSignal::UpdateProperty(prop) => {
+                if self.properties.update(*prop) {
+                    self.schedule_menu_snapshot();
+                } else {
+                    tracing::debug!("UpdateProperty for a key the engine never registered; dropped");
+                }
+            }
+            // Candidates and auxiliary text. The candidate window takes what
+            // it recognises and drops the rest.
             other => {
                 if let Some(popup) = self.popup.as_mut() {
                     popup.on_signal(other);
@@ -966,6 +1002,25 @@ impl Frontend {
         self.im.commit(self.serial);
     }
 
+    /// Takes one command from the rest of the process.
+    ///
+    /// Three destinations: turn-taking stays here, an engine switch is the
+    /// switcher's (it owns the panel connection and the cycle), and a menu
+    /// activation is the context's, because `PropertyActivate` is an
+    /// input-context method that the daemon hands to that context's engine.
+    fn on_command(&mut self, command: ImCmd) {
+        match command {
+            ImCmd::Dictation(command) => self.on_dictation(command),
+            ImCmd::SetEngine(name)    => self.switcher.set_engine(&name),
+            ImCmd::ActivateProperty { key, state } => {
+                tracing::info!("activating property {key} state={state}");
+                self.with_context("PropertyActivate", |context| {
+                    context.property_activate(&key, state)
+                });
+            }
+        }
+    }
+
     /// Takes one command from the dictation engine.
     ///
     /// The decision is [`dictation::advance`]'s and the whole of it; this is
@@ -1008,6 +1063,79 @@ impl Frontend {
                 self.preedit = None;
             }
         }
+    }
+
+    /// The engine registered its status menu, or the daemon emptied it.
+    ///
+    /// The daemon sends an *empty* list of its own on every `FocusOut`
+    /// (`bus/inputcontext.c:2037`), before the engine ever hears about the
+    /// focus change. Honouring that one would blank the indicator every time
+    /// focus left a text field, and `ibus-ui-gtk3` never did: its glyph only
+    /// ever changed on a non-empty symbol. So an empty registration arriving
+    /// while no field is active is taken as that housekeeping and dropped.
+    /// The other empty registration the daemon sends, from
+    /// `bus_input_context_unset_engine` on an engine switch (`:3051`), comes
+    /// while a field *is* active and is honoured — it is the only way an xkb
+    /// engine's empty menu ever arrives, since xkb engines register nothing.
+    fn on_register_properties(&mut self, list: crate::ibus::PropList) {
+        if list.properties.is_empty() && !self.active {
+            tracing::debug!("empty RegisterProperties with no field active; keeping the menu");
+            return;
+        }
+        if self.properties.register(list) {
+            self.schedule_menu_snapshot();
+        }
+    }
+
+    /// The global engine changed, by the hotkey, the popup or anybody else.
+    ///
+    /// With a field active the context's own signal stream already carries
+    /// the change in order: the daemon empties the menu when it unsets the
+    /// old engine and the new one registers on its `FocusIn`, both on the
+    /// same connection. Clearing here as well would race that stream — the
+    /// panel connection is a different socket, and `GlobalEngineChanged`
+    /// can arrive after the new engine's registration, wiping it. With no
+    /// field active nothing is coming on the context stream at all, and the
+    /// menu belongs to an engine that is no longer in effect, so that is the
+    /// case this clears. Published either way, because the engine's
+    /// `icon_prop_key` may have changed under an unchanged list.
+    fn on_engine_changed(&mut self) {
+        if !self.active {
+            self.properties.clear();
+        }
+        self.schedule_menu_snapshot();
+    }
+
+    /// Arranges for one snapshot once the current burst of changes settles.
+    fn schedule_menu_snapshot(&mut self) {
+        if self.menu_pending {
+            return;
+        }
+        self.menu_pending = true;
+
+        let scheduled = self.handle.insert_source(
+            Timer::from_duration(MENU_SETTLE),
+            |_, _, frontend| {
+                frontend.menu_pending = false;
+                frontend.publish_properties();
+                TimeoutAction::Drop
+            },
+        );
+        if let Err(e) = scheduled {
+            tracing::warn!("could not schedule the menu snapshot; publishing now: {e}");
+            self.menu_pending = false;
+            self.publish_properties();
+        }
+    }
+
+    /// Sends the applet the menu and the glyph as they stand.
+    fn publish_properties(&mut self) {
+        let indicator = self.properties.indicator(self.switcher.icon_prop_key());
+        let menu = self.properties.menu();
+        self.switcher.publish(ImEvent::Properties {
+            indicator: indicator,
+            menu     : menu,
+        });
     }
 
     /// Deletes text around the caret on the engine's behalf.
