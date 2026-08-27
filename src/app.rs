@@ -228,19 +228,29 @@ impl cosmic::Application for App {
             _ => name,
         };
 
-        let Some(glyph) = self.indicator() else {
+        // The slot beside the icon exists for as long as the multiplexer is
+        // running, glyph or no glyph. The panel sizes the applet once from
+        // what it draws, so a button that grows when mozc's あ appears and
+        // shrinks when an xkb engine takes over is clipped at its old width
+        // until something else makes the panel lay itself out again. One
+        // relayout when the mode turns on is fine; one per engine switch is
+        // a button that is cut off at random.
+        if !matches!(self.input_method, InputMethodState::Running { .. }) {
             return self
                 .core
                 .applet
                 .icon_button(name)
                 .on_press_down(Message::TogglePopup)
                 .into();
-        };
+        }
 
         let (width, _) = self.core.applet.suggested_size(true);
         let (major, minor) = self.core.applet.suggested_padding(true);
         let icon = widget::icon::from_name(name).symbolic(true).size(width);
-        let glyph = self.core.applet.text(glyph);
+        let glyph = widget::container(self.core.applet.text(self.indicator().unwrap_or("")))
+            .width(Length::Fixed(f32::from(width)))
+            .height(Length::Fixed(f32::from(width)))
+            .center(Length::Fill);
         let content: Element<'_, Message> = if self.core.applet.is_horizontal() {
             widget::row::with_capacity(2)
                 .push(icon)

@@ -8,7 +8,14 @@ Everything interesting is printed to stdout, line buffered:
     ENTRY <text>          the entry's buffer changed (committed text)
     PREEDIT <text>        the entry's preedit string changed
     KEY <keyname>         a key press reached the widget (debugging aid)
+    FOCUS <in|out>        the entry gained or lost focus (after a command)
     BYE                   window closed
+
+And read from stdin, one per line:
+
+    blur                  take focus away from the entry: GTK sends
+                          text-input-v3 `disable`, the field deactivates
+    focus                 give it back
 
 Run it only through run-entry-client.sh, which points it at the NESTED
 compositor and forces the GTK "wayland" IM module so that GTK speaks
@@ -47,6 +54,22 @@ class App:
         self.entry.connect("key-press-event", self.on_key)
         self.win.connect("destroy", self.on_destroy)
         self.win.connect("map-event", self.on_map)
+        self.entry.connect("focus-in-event", lambda *_: emit("FOCUS in") or False)
+        self.entry.connect("focus-out-event", lambda *_: emit("FOCUS out") or False)
+        GLib.io_add_watch(sys.stdin, GLib.IO_IN | GLib.IO_HUP, self.on_stdin)
+
+    def on_stdin(self, source, condition):
+        line = source.readline()
+        if not line:
+            return False
+        command = line.strip()
+        if command == "blur":
+            self.win.set_focus(None)
+        elif command == "focus":
+            self.entry.grab_focus()
+        else:
+            emit("UNKNOWN %s" % command)
+        return True
 
     def on_changed(self, entry):
         emit("ENTRY %s" % entry.get_text())

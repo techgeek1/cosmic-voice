@@ -268,6 +268,14 @@ pub struct Frontend {
     /// the end of a burst of updates, not every step of it, so the first
     /// change starts a [`MENU_SETTLE`] timer and the rest ride on it.
     menu_pending: bool,
+    /// A status-menu activation that arrived while no field was active,
+    /// waiting for the next `FocusIn`. Last one wins: with `use-global-engine`
+    /// the daemon detaches the engine from a context the moment it loses
+    /// focus (`bus/ibusimpl.c:910-914`) and parks it on its own fake context,
+    /// so `PropertyActivate` on ours would reach `context->engine == NULL`
+    /// and be dropped without a word (`bus/inputcontext.c:1383`). The popup
+    /// is exactly that situation — opening it takes the focus the field had.
+    pending_property: Option<(String, u32)>,
 
     /// For scheduling repeat timers.
     handle      : LoopHandle<'static, Frontend>,
@@ -410,6 +418,7 @@ pub fn run(options: Options) -> Result<()> {
         commands    : options.link.clone(),
         properties  : Properties::new(),
         menu_pending: false,
+        pending_property: None,
         handle      : handle.clone(),
         stop        : event_loop.get_signal(),
     };
@@ -653,6 +662,11 @@ impl Frontend {
         self.with_context("FocusIn", |context| context.focus_in());
         self.push_content_type();
         self.push_surrounding();
+        // Method calls are ordered on the connection, so the engine the
+        // daemon attaches while handling `FocusIn` is there for this one.
+        if let Some((key, state)) = self.pending_property.take() {
+            self.activate_property(&key, state);
+        }
 
         if let Some(engine) = self.link.global_engine() {
             tracing::info!("ibus engine {engine}");
@@ -1013,10 +1027,12 @@ impl Frontend {
             ImCmd::Dictation(command) => self.on_dictation(command),
             ImCmd::SetEngine(name)    => self.switcher.set_engine(&name),
             ImCmd::ActivateProperty { key, state } => {
-                tracing::info!("activating property {key} state={state}");
-                self.with_context("PropertyActivate", |context| {
-                    context.property_activate(&key, state)
-                });
+                if self.active {
+                    self.activate_property(&key, state);
+                } else {
+                    tracing::info!("no field active; holding property {key} for the next focus");
+                    self.pending_property = Some((key, state));
+                }
             }
         }
     }
@@ -1063,6 +1079,14 @@ impl Frontend {
                 self.preedit = None;
             }
         }
+    }
+
+    /// Sends one status-menu activation to the engine behind the context.
+    ///
+    /// Only meaningful while a field is active — see `pending_property`.
+    fn activate_property(&mut self, key: &str, state: u32) {
+        tracing::info!("activating property {key} state={state}");
+        self.with_context("PropertyActivate", |context| context.property_activate(key, state));
     }
 
     /// The engine registered its status menu, or the daemon emptied it.

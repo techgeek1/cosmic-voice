@@ -24,6 +24,8 @@
 #                       answers with UpdateProperty, and the indicator changes
 #   4. it is real       konnnitiha now arrives as ASCII: direct mode
 #   5. and back         InputMode.Hiragana converts again
+#   5b. held             an activation with no field active (the popup's
+#                        case) is held and applied on the next FocusIn
 #   6. engine change    SetEngine xkb:us::eng empties the menu and the glyph
 #   7. re-registration  SetEngine mozc-on brings them back
 #
@@ -39,6 +41,7 @@ set +e
 BIN="$repo/target/debug/cosmic-voice"
 WORK="$IM_HARNESS_STATE/property-test"
 FIFO="$WORK/control.fifo"
+ENTRY_FIFO="$WORK/entry.fifo"
 mkdir -p "$WORK"
 rm -f "$WORK"/*
 
@@ -53,7 +56,8 @@ cleanup() {
         [ -n "$pid" ] && kill -TERM -- "-$pid" 2>/dev/null
     done
     sleep 0.5
-    rm -f "$FIFO"
+    exec 4>&- 2>/dev/null
+    rm -f "$FIFO" "$ENTRY_FIFO"
     "$here/scratch-ibus.sh" stop >/dev/null 2>&1
     "$here/nested-comp.sh" stop >/dev/null 2>&1
 }
@@ -122,7 +126,7 @@ cat > "$WORK/config.ron" <<RON
 )
 RON
 
-mkfifo "$FIFO" || { echo "could not create $FIFO"; exit 2; }
+mkfifo "$FIFO" "$ENTRY_FIFO" || { echo "could not create the fifos"; exit 2; }
 
 RUST_LOG=cosmic_voice=debug setsid "$BIN" devtest im-frontend "$HARNESS_WAYLAND_DISPLAY" "$ibus_address" \
     --config "$WORK/config.ron" \
@@ -136,8 +140,12 @@ grep -q 'input method bound' "$WORK/frontend.log" || {
     exit 1
 }
 
-setsid "$here/run-entry-client.sh" property > "$WORK/entry.out" 2>/dev/null &
+setsid "$here/run-entry-client.sh" property < "$ENTRY_FIFO" > "$WORK/entry.out" 2>/dev/null &
 entry_pid=$!
+# Hold the write end open for the run, so the client's stdin never hits EOF.
+exec 4>"$ENTRY_FIFO"
+# One line to the entry client: blur or focus.
+entry() { printf '%s\n' "$1" >&4; sleep 0.5; }
 for _ in $(seq 1 120); do grep -q '^READY' "$WORK/entry.out" 2>/dev/null && break; sleep 0.1; done
 grep -q '^READY' "$WORK/entry.out" || { echo "FAIL: entry client never reported READY"; exit 1; }
 sleep 2
@@ -188,6 +196,30 @@ inject type aiueo sleep 1000
 check "hiragana converts again" "あいうえお" "$(preedit_text)"
 inject key $ENTER sleep 800
 check "and commits into the field" "konnnitihaあいうえお" "$(entry_text)"
+
+# 5b. The popup's case. Opening the applet popup takes keyboard focus, so
+#     the field deactivates before the user can click anything in it — and
+#     with use-global-engine the daemon detaches the engine from a context
+#     the moment it loses focus (`bus/ibusimpl.c:910-914`), so a
+#     PropertyActivate sent then reaches `context->engine == NULL` and is
+#     dropped silently (`bus/inputcontext.c:1383`). The frontend holds the
+#     activation and sends it right after the next FocusIn.
+entry blur
+grep -q 'FOCUS out' "$WORK/entry.out" || echo "WARN: the entry did not report losing focus"
+control '{"ActivateProperty":{"key":"InputMode.Direct","state":1}}'
+sleep 0.5
+check "with no field active the activation is held, not applied" "あ" "$(indicator)"
+if frontend_log | grep -q 'holding property InputMode.Direct'; then
+    echo "PASS: the frontend said it was holding it"
+else
+    echo "FAIL: no 'holding property' line"
+    frontend_log | grep -i 'propert' | tail -3
+    fails=$((fails + 1))
+fi
+entry focus
+check "and applied on the next focus-in" "A" "$(await_indicator "A")"
+control '{"ActivateProperty":{"key":"InputMode.Hiragana","state":1}}'
+check "hiragana again, with the field active" "あ" "$(await_indicator "あ")"
 
 # 6. Switching to an xkb engine, which registers nothing. With the field
 #    active the daemon empties the list on the context stream when it unsets

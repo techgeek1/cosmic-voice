@@ -1235,6 +1235,31 @@ these corrections. Citations are into the 1.5.34 tree unless stated.
    properties decoded, which is the fastest way to see what an engine
    actually sends and is safe on the live daemon.
 
+10. **A status-menu activation with no field active goes nowhere, and the
+    popup is exactly that case.** Found live on the first look at phase 6:
+    picking Hiragana in the popup did nothing. With `use-global-engine` the
+    daemon detaches the engine from a context the instant it loses focus
+    and parks it on its own fake context (`bus/ibusimpl.c:910-914`,
+    `:951`, `:1002`); `PropertyActivate` on our context then meets
+    `context->engine == NULL` and returns success having done nothing
+    (`bus/inputcontext.c:1383`). Opening the applet popup takes keyboard
+    focus, so the field is always inactive by the time anything in it is
+    clicked. `ibus-ui-gtk3` never had this problem because its activation
+    went through the panel proxy to whichever context the daemon considered
+    current, fake one included. Ours holds the activation (last wins) and
+    sends it right after the next `FocusIn`: method calls are ordered on the
+    connection, so the engine the daemon attaches while handling `FocusIn`
+    is in place for it. The harness entry client grew `blur`/`focus` stdin
+    commands to reproduce it (property-test.sh 5b).
+
+11. **The panel button must not change size.** cosmic-panel sizes an applet
+    from what it first draws; a button that grows when mozc's あ appears and
+    shrinks when an xkb engine takes over is clipped at the old width until
+    something else triggers a relayout — seen live as an icon "cut off at
+    random". The glyph's slot is reserved (icon-sized, blank when there is
+    no indicator) for as long as the multiplexer is running, so the only
+    size change is the one when the mode turns on.
+
 ### What was verified, and how
 
 `scripts/im-harness/property-test.sh` is the phase-6 regression, thirteen
