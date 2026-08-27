@@ -259,6 +259,19 @@ impl Bus {
         Ok(self.daemon.global_shortcut_keys()?)
     }
 
+    /// Registers the engine-switch trigger, taking on the panel's role.
+    ///
+    /// Two things happen inside the daemon as a result, both of them global
+    /// and neither of them undoable: `ProcessKeyEvent` starts consuming the
+    /// trigger and answering `GlobalShortcutKeyResponded`
+    /// (`bus/ibusimpl.c:2591-2664`), and `bus_ibus_impl_is_wayland_session`
+    /// starts returning true (`:2666-2672`), which arms the `ignore_focus_out`
+    /// trap for every client whose name does not begin `wayland`. See
+    /// [`super::CLIENT_NAME`]. There is no unregister.
+    pub fn set_global_shortcut_keys(&self, keys: ShortcutKeys) -> Result<()> {
+        Ok(self.daemon.set_global_shortcut_keys(keys)?)
+    }
+
     /// Looks up engines by id, decoded. Names the registry does not know are
     /// dropped, so compare lengths if that matters.
     pub fn engines_by_names(&self, names: &[&str]) -> Result<Vec<EngineDesc>> {
@@ -275,6 +288,16 @@ impl Bus {
                 reason: format!("echoed a {} back", other.value_signature()),
             }),
         }
+    }
+
+    /// The connection underneath, for the parts of this module that need a
+    /// raw message stream or a call the proxies do not cover.
+    ///
+    /// Crate-private on purpose: a bare connection invites bypassing the typed
+    /// wrappers above, and the only legitimate user is [`super::Panel`], which
+    /// needs `AddMatch` and a second [`super::Signals`] on the same socket.
+    pub(super) fn connection(&self) -> &zbus::blocking::Connection {
+        &self.connection
     }
 
     /// Creates an input context and puts it into the state the multiplexer

@@ -69,6 +69,53 @@ directory's own command lines contain every pattern you would want to match,
 and the user's panel applet is also called `cosmic-voice`. Kill by recorded
 pid, as the scripts do.
 
+    scripts/im-harness/candidate-test.sh
+
+The phase-3 candidate window, end to end. Same scaffolding as
+`frontend-test.sh`, with the frontend at `RUST_LOG=cosmic_voice=debug` because
+the popup's evidence is on the debug lines. Injects `konnnitiha`, space and Tab
+and asserts on the frontend's log:
+
+    PASS: a font was chosen: "Noto Sans CJK JP" (904 faces, 56ms to load)
+    PASS: a palette was read: COSMIC dark
+    PASS: the compositor sent a caret rectangle: 0x32 at 41,70
+    PASS: mozc sent a visible lookup table: ... 9 candidates, page 9, cursor 1
+    PASS: a 194x288 buffer was attached and committed
+    PASS: moving the selection produced another table (11 -> 12)
+    PASS: the window was hidden on commit
+    PASS: the conversion committed into the entry: コンニチハ
+
+Space then Tab rather than space alone: space converts, and mozc keeps the
+candidate list closed until asked, which is what its own auxiliary text
+(「Tabキーで選択」) is telling the user.
+
+    scripts/im-harness/switcher-test.sh
+
+The phase-4 panel duties, end to end. Same scaffolding as `frontend-test.sh`,
+plus a config file passed with `devtest im-frontend --config` that pins
+`ibus_triggers` to `["<Control><Alt>space"]` and `ibus_engines` to
+`["xkb:us::eng", "mozc-on"]` — neither the scratch daemon's dconf (empty, it
+runs `--config disable`) nor the frontend's inherited dconf (the user's real
+settings) is a fixture, so the override is what makes exact assertions
+possible. Injects the trigger over libei and asserts on the daemon's global
+engine:
+
+    PASS: trigger registered: control|mod1+space, shift|control|mod1+space
+    PASS: the cycle starts on xkb:us::eng
+    PASS: Ctrl+Alt+Space switched to mozc-on
+    PASS: pressing it again switched back
+    PASS: Shift+Ctrl+Alt+Space reported the backward binding
+    PASS: the backward trigger also switched the engine
+    PASS: mozc converted after the switch
+
+Ctrl+Alt+Space rather than the schema default `<Super>space` because
+cosmic-comp filters its own compositor shortcuts before the input-method grab
+sees them, and Super combinations are where those live. With a two-entry cycle
+forward and backward land on the same engine, so the *direction* is a unit test
+(`im::switcher::tests::cycles_both_ways`) and what this asserts is that the
+backward registration exists and that the flag — which travels in the
+`a(uuu)` keycode slot — survives the round trip.
+
     scripts/im-harness/smoke-test.sh ["text to type"]
 
 The harness checking itself, without the frontend in the loop:
@@ -179,6 +226,15 @@ with `HOME`/`XDG_*_HOME` under the harness tree.
   neither read nor written. Consequence: `preload-engines` is empty on the
   scratch daemon and `registry` reports `0 active` engines; use
   `scratch-ibus.sh engine <name>` (`SetGlobalEngine`) to select one.
+* `MOZC_IBUS_CANDIDATE_WINDOW=ibus` is in the engine's environment, and it is
+  load-bearing. mozc picks its candidate window at engine startup from
+  `WAYLAND_DISPLAY` and `XDG_CURRENT_DESKTOP`; with `WAYLAND_DISPLAY` unset —
+  which is deliberate here, nothing may reach a compositor — it decides it is
+  on X11 and drives its own `mozc_renderer`, emitting **no lookup tables at
+  all**. Without this variable the candidate path is silently untested. On the
+  live session `WAYLAND_DISPLAY` is set and COSMIC is not in
+  `compatible_wayland_desktop_names` (`["GNOME"]`), so the IBus path is what
+  really runs; this forces the same thing without a compositor.
 * There is no `--xim=no`; `-x/--xim` is a flag, and omitting it means no XIM
   server.
 * ibus-daemon exits when its parent process dies, so it is started under a
@@ -200,17 +256,33 @@ processes, one with `HOME=/home/<user>` (live) and one with
 These need a human at the keyboard and are deliberately not scripted:
 
 * **Candidate window / preedit appearance.** The nested compositor renders on
-  the live desktop; look at its window. There is no scripted screenshot yet.
+  the live desktop; look at its window. `candidate-test.sh` asserts everything
+  up to the pixels — buffer sizes, the caret rectangle, the unmap on commit —
+  and `cargo test` writes PNGs of fixture candidate lists under
+  `$COSMIC_VOICE_RENDER_DIR`, but nothing captures what the compositor actually
+  put on screen; see "Known gaps".
 * **Anything binding the live seat's IM slot** - the phase-2 cutover, the
   visual pass, final acceptance. Keep a recovery shell open. `pkill
   cosmic-voice` must restore key flow; if it does not, kill ibus.
-* **Engine-switch hotkeys** (phase 4): registering global shortcut keys with
-  the daemon arms ibus's `ignore_focus_out` trap, so test it against the
-  scratch daemon first.
+Engine-switch hotkeys are no longer on this list. `switcher-test.sh` covers
+them against the scratch daemon, and the frontend refuses to register anything
+on a daemon whose panel is still `ibus-ui-gtk3` unless an explicit ibus address
+is given — the registration is a last-writer-wins global with no unregister,
+and the daemon broadcasts the response to every subscriber, so two panels
+would both act on one press. Registering also arms ibus's `ignore_focus_out`
+trap (`docs/multiplexer.md`, phase-1 finding 1); our client name opts out of
+it, but nothing else on the live daemon would.
 
 ## Known gaps
 
-* No screenshot capture from the nested compositor.
+* No screenshot capture from the nested compositor, and no off-the-shelf way to
+  add one. cosmic-comp advertises `ext_image_copy_capture_manager_v1` (with
+  `ext_output_image_capture_source_manager_v1`) and **not**
+  `zwlr_screencopy_manager_v1`, so `grim` would not work even if it were
+  installed, and `cosmic-screenshot` goes through the xdg-desktop-portal
+  Screenshot interface on the *live* session bus, which the nested
+  compositor's private bus cannot activate. Closing this gap means writing an
+  `ext-image-copy-capture` client.
 * The nested compositor logs `[EGL] 0x300d (BAD_SURFACE) eglQuerySurface` once
   at startup under winit; it is harmless, rendering works.
 * The scratch daemon's `devtest ibus-info` prints `daemon pid -` because the

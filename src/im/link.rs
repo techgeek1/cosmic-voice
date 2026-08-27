@@ -51,13 +51,24 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 // --- Events out ---
 
-/// What the signal thread delivers into the loop.
+/// What the signal threads deliver into the loop.
+///
+/// Two connections feed this: the input context's, and the panel's
+/// ([`super::switcher`]). They are separate variants rather than separate
+/// channels because the loop has one channel source and the two connections
+/// fail for the same reason at the same moment.
 #[derive(Debug)]
 pub enum Upstream {
     /// The daemon sent something outside any key's drain.
     Signal(ContextSignal),
     /// The connection ended. Everything built on it is gone.
     Lost,
+    /// The daemon's own object announced something: a fired shortcut, an
+    /// engine change, a rebuilt registry.
+    Panel(crate::ibus::PanelSignal),
+    /// The panel connection ended, so the trigger registration is gone with
+    /// the daemon that held it.
+    PanelLost,
 }
 
 // --- The link ---

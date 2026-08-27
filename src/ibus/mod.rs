@@ -39,6 +39,7 @@
 mod address;
 mod bus;
 mod context;
+mod panel;
 mod text;
 
 pub use address::Address;
@@ -49,6 +50,7 @@ pub use context::{
     PREEDIT_COMMIT, PostRecord, RELEASE_MASK, SHIFT_MASK, SUPER_MASK, SignalStream,
     describe_capabilities, describe_state,
 };
+pub use panel::{BINDING_TYPE_IME_SWITCHER, Panel, PanelSignal, PanelStream, Shortcut};
 pub use text::{
     LookupTable, ORIENTATION_HORIZONTAL, ORIENTATION_SYSTEM, ORIENTATION_VERTICAL, Text,
 };

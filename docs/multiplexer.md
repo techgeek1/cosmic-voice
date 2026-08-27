@@ -216,6 +216,15 @@ cycles, the panel applet can display the current engine name. (The daemon's
 own release-signal latency workaround suggests keeping any future
 press/release switcher state client-side.)
 
+Four corrections from building it, all detailed in the phase-4 findings: the
+response signal is a **broadcast filtered by `AddMatch`**, so subscribing is
+not optional and two subscribers both act; the `keycode` field of a
+registration is the **backward flag**, not a keycode; the modifiers must be
+spelled in the bits that survive `IBUS_MODIFIER_FILTER`, which means `MOD4`
+rather than `SUPER`; and because the response is broadcast and the property is
+last-writer-wins with no unregister, the panel role is exclusive in practice —
+the switcher stays entirely inert while `ibus-ui-gtk3` still holds it.
+
 ## Turn-taking (the point of all this)
 
 Router states, one per activation:
@@ -275,9 +284,11 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
    (finding 3 below): the choice for phase 2 is between ticking zbus's own
    executor from a calloop source and building zbus with `async-io` so its
    reactor fd can be registered directly.
-2. **Candidate paint stack**: tiny-skia + cosmic-text (recommended: small,
-   no toolkit, we control the surface) vs embedding iced (heavy; iced cannot
-   target an IM popup surface without surgery).
+2. **Candidate paint stack**: ~~tiny-skia + cosmic-text vs embedding iced~~.
+   Closed by phase 3 as recommended: tiny-skia 0.11 and cosmic-text 0.19, both
+   already in the graph through libcosmic's iced, so the whole renderer added
+   nothing new to build. iced was never a real option — see phase-3 finding 1
+   for what an input-popup surface actually is.
 3. **Engine switcher UX**: cycle-only v1 (recommended) vs popup list.
 4. **Upstream fix**: file the smithay `add_instance` bug with the incident
    as the repro narrative. Costs an afternoon, benefits everyone who ever
@@ -285,10 +296,14 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
 
 ## Build strategy (banked 2026-08-25)
 
-Status: **phases 1 and 2 done (2026-08-26)**, `src/ibus/` and `src/im/` — see
-the findings sections below for what implementing them corrected in this
-document. Phase 2 is code-complete and unit-tested but has not yet been run
-against a live seat; phases 3–5 not started.
+Status: **phases 1 to 4 done (2026-08-27)**, `src/ibus/` and `src/im/` —
+see the findings sections below for what implementing them corrected in this
+document. All four are code-complete, unit-tested and green in the nested
+harness, and none has been run against a live seat: phase 4's switcher is
+deliberately inert on the live daemon while `ibus-ui-gtk3` is still its panel
+(phase-4 finding 8), so the cutover remains the one attended step, together
+with the visual pass on the candidate window that no screenshot client on this
+machine can automate (phase-3 finding 9). Phase 5 not started.
 
 Implementation will be agent-driven, which changes the bottleneck: the
 mechanical bulk (proxies, codec, relay tables) is hours of wall clock, and the
@@ -534,3 +549,293 @@ What still needs a human: anything on the live seat (the cutover itself), and
 the visual pass — the nested compositor renders on the live desktop but there
 is no scripted screenshot, so preedit styling and, from phase 3, the candidate
 window are looked at rather than asserted.
+
+## Findings from phase 4 (2026-08-27)
+
+Registering the engine-switch trigger and cycling engines against ibus 1.5.34.
+Citations are into the 1.5.34 tree unless stated.
+
+1. **`GlobalShortcutKeyResponded` is a broadcast filtered by match rule, and
+   nothing else.** The design and the phase-1 proxy left "who receives it" open.
+   The answer: `bus_ibus_impl_emit_signal` builds a signal with **no
+   destination** and hands it to `bus_dbus_impl_dispatch_message_by_rule`
+   (`bus/ibusimpl.c:2477-2492`), whose recipient list is built by walking
+   `dbus->rules` and asking each for its matching connections
+   (`bus/dbusimpl.c:1996-2019`). The rules are the ones clients registered with
+   `AddMatch` (`bus/dbusimpl.c:960-999`). So it goes to **every connection
+   holding a matching match rule** — not to the client that called
+   `SetGlobalShortcutKeys`, not to the focused input context's connection, and
+   not to anybody who merely declared the signal in a proxy. A client that does
+   not `AddMatch` sees nothing; two clients that do both see it and both act.
+   That last part is why phase 4 refuses to run at all when `ibus-ui-gtk3` is
+   the daemon's panel (below), rather than merely declining to register.
+   ibus-daemon rewrites `sender='org.freedesktop.IBus'` in a rule to its own
+   unique name as a special case (`bus/dbusimpl.c:976-978`), so the obvious
+   rule text works.
+2. **The `keycode` field of a registration is the backward flag, not a
+   keycode.** `is_backward = ibus->ime_switcher_keys[i].keycode != 0`
+   (`bus/ibusimpl.c:2622`); `ibus-ui-gtk3` writes `kb.reverse ? 1 : 0` into it
+   (`ui/gtk3/panel.vala:549`). Nothing ever compares it against a hardware
+   keycode. Putting a real evdev+8 there — the natural reading of `a(uuu)` —
+   would silently register every trigger as backward. The same field in the
+   *outgoing* `GlobalShortcutKeyResponded` is a genuine keycode: the harness log
+   shows `keycode=65` for space, `keycode=37` for Control_L. The wire type is
+   symmetric and the meaning is not.
+3. **The enum is `IBusBusGlobalBindingType` and it lives in `ibusbus.h:79-84`**
+   — `ANY` 0, `IME_SWITCHER` 1, `EMOJI_TYPING` 2 — not in `ibustypes.h` and not
+   under a `…GLOBAL_SHORTCUT_KEYS…` name. Only `IME_SWITCHER` is storable:
+   the setter's `switch` has one case and a `default` that frees the keys it was
+   handed (`bus/ibusimpl.c:2039-2050`), so registering the emoji type in 1.5.34
+   stores nothing and fires nothing.
+4. **A registration must be spelled in modifiers the daemon can still see when
+   it compares.** Before matching, the daemon rewrites `SUPER` to `MOD4` and
+   then masks with `IBUS_MODIFIER_FILTER` (`bus/ibusimpl.c:2615-2619`), and that
+   filter *excludes* `SUPER`, `HYPER` and `META` (`ibustypes.h:386-398`). A
+   trigger registered with `IBUS_SUPER_MASK` can therefore never match anything.
+   `<Super>space` — the schema default — has to be registered as `MOD4`. GTK's
+   panel gets there by a different road, `gdk_keymap_map_virtual_modifiers`
+   (`ui/gtk3/bindingcommon.vala:73-84`); we map `<Super>`/`<Hyper>` to MOD4 and
+   `<Meta>` to MOD1 directly, which is where a standard X keymap puts them.
+5. **The trigger is consumed before focus, before the engine, and before the
+   post-process queue.** `_ic_process_key_event` calls
+   `bus_ibus_impl_process_key_event` first and, on a hit, returns `(b) TRUE` and
+   clears `processing_key_event` (`bus/inputcontext.c:1085-1099`). So the sync
+   drain is empty for a trigger press, the routing rules see `handled=true` and
+   swallow it, and no space is typed. It also means *any* context can trigger a
+   switch, focused or not.
+6. **Every use of a modified trigger fires the signal twice, and the second one
+   swallows a key release.** Press gives a hit with the press state; releasing
+   the trigger key while the modifiers are held gives no hit; releasing the last
+   modifier gives a *second* hit with `RELEASE_MASK` set
+   (`bus/ibusimpl.c:2626-2647`, driven by a file-static `binding_state`). That
+   is the panel's switcher-popup protocol — press moves the selection, release
+   commits it. Cycle-only v1 acts on the press and ignores the release. The
+   side effect is worth knowing: because the release edge also answers
+   `handled=true`, the frontend swallows that key release and the application
+   never sees it. Measured in the harness, `Control_L release` after
+   Ctrl+Alt+Space is swallowed. Harmless as things stand — the grab's
+   `modifiers` events are forwarded to the virtual keyboard independently, so
+   the compositor-level modifier state stays correct — but an application that
+   tracks modifiers from key events alone would see one stuck.
+7. **Correction to phase-1 finding 9.** "The engine attaches to a context only
+   on `FocusIn`" is true of the *first* attach and false of a switch:
+   `bus_ibus_impl_set_global_engine_by_name` changes the engine on the focused
+   context directly (`bus/ibusimpl.c:1007-1038`), so a `SetGlobalEngine` while
+   our context is focused takes effect immediately with no refocus. The harness
+   proves it — mozc converts `konnnitiha` right after a switch into `mozc-on`.
+8. **The panel role is exclusive in practice even though nothing enforces it.**
+   `GlobalShortcutKeys` is last-writer-wins with no unregister, and (finding 1)
+   the response is broadcast. So with `ibus-ui-gtk3` running as the session's
+   panel, registering would replace its trigger while it is still acting on the
+   response, and *both* processes would cycle the engine on every press. The
+   nested-display argument does not help here: a display has seats, a daemon
+   does not. `im::run` therefore leaves the switcher entirely inert when
+   `ibus-ui-gtk3 --enable-wayland-im` is running and no explicit ibus address
+   was given, and says so in the log. This is the phase-4 analogue of the
+   input-method binding check, and it is the reason phase 4 could be developed
+   and tested without an attended session.
+9. **Engine cycling reads dconf by shelling out to `gsettings`.** Nothing in the
+   dependency graph pulls glib in, and adding `gio` to read three string lists
+   at startup would be the largest dependency in the tree by build time. The
+   engine list reproduces the panel's own construction: `engines-order`
+   intersected with `preload-engines`, then whatever the order does not mention
+   (`ui/gtk3/panel.vala:1390-1408`). The panel then keeps that list in MRU order
+   with the current engine at index 0 and switches to index 1 or `len - 1`
+   (`ui/gtk3/panel.vala:1345-1352`); we do not, because MRU is what makes its
+   switcher popup useful and, with no popup, only makes the cycle
+   unpredictable. `config.ron`'s `ibus_triggers` and `ibus_engines` override
+   both lists, which is what gives the harness known fixtures — the scratch
+   daemon runs `--config disable` with an `XDG_CONFIG_HOME` of its own, so its
+   dconf is empty and its `preload-engines` with it.
+10. **The switch is confirmed, not assumed.** `SetGlobalEngine` returning
+    success does not mean the engine changed — the daemon can refuse, and the
+    engine can change from elsewhere. `current` is only ever updated from
+    `GlobalEngineChanged`, which the daemon emits either way, so the cycle
+    cannot drift from what is really in effect. Measured latency in the
+    harness: 210ms for the first switch into `mozc-on` (engine process
+    startup), ~1ms after that.
+11. Minor: registering makes `bus_ibus_impl_is_wayland_session` true
+    (`bus/ibusimpl.c:2666-2672`), which arms the `ignore_focus_out` trap of
+    phase-1 finding 1 — our client name already opts out, and this is now the
+    code path that arms it rather than a future one. Holding the trigger down
+    repeats it, because `xkb_keymap_key_repeats` is true for space and the
+    frontend's repeat timer does not know the key was a shortcut; a tap is well
+    inside the 600ms delay, so it only bites someone who holds the combination.
+    Registering an empty list is refused by the daemon
+    (`g_return_val_if_fail (size > 0, FALSE)`, `bus/ibusimpl.c:2025`), so
+    nothing is sent when no accelerator parsed.
+
+### What was verified, and how
+
+`scripts/im-harness/switcher-test.sh`, all seven assertions green on
+2026-08-27 against the scratch daemon: the `(ya(uuu))` `Set` is accepted;
+Ctrl+Alt+Space moves `xkb:us::eng` → `mozc-on` and back; the Shift-modified
+trigger arrives with `is_backward` set, which is the keycode-slot encoding
+making a full round trip; and mozc converts `konnnitiha` afterwards, which it
+could not do if the engine had not really changed. `frontend-test.sh` still
+passes unchanged, and in that run the panel takes its trigger from the *live*
+dconf (read-only) rather than from a config file, which is the other half of
+the path.
+
+What still needs a human: the live cutover, unchanged. Phase 4 adds nothing to
+that list — the guard in finding 8 means the switcher is inert on the live
+daemon until `ibus-ui-gtk3 --enable-wayland-im` is retired, which is the same
+moment the input-method binding becomes ours.
+
+## Findings from phase 3 (2026-08-27)
+
+Building the candidate window against the input-method protocol, cosmic-comp's
+pinned smithay, ibus 1.5.34's panel and mozc 3.34 turned up these corrections.
+Citations are into ibus 1.5.34, smithay `e3d461a` (cosmic-comp's pin) and the
+protocol XML in `wayland-protocols-misc 0.3.12`.
+
+1. **`zwp_input_popup_surface_v2` has no configure, no ack, no size request
+   and no visibility control.** The whole interface is one event
+   (`text_input_rectangle`) and one destructor
+   (`input-method-unstable-v2.xml:366-390`). The compositor decides visibility
+   — "visible if and only if the input method is in the active state" — and
+   derives the popup's *size* from the committed buffer: cosmic-comp calls
+   `bbox_from_surface_tree` on the surface and places the result below the
+   caret rectangle, clamped right, flipped up if the bottom would overflow
+   (`xdg_shell/popup.rs:178-205`). So the client's only levers are the buffer
+   and its dimensions. Hiding is therefore a **null-buffer commit** — core
+   Wayland unmapping, not a protocol request. Verified working in the harness.
+
+2. **The popup surface must be created once and kept, not per activation** —
+   the opposite of the grab and the virtual keyboard, and the doc's suggestion
+   that it could go either way is wrong on this compositor. Smithay's
+   `activate_input_method` re-registers whatever popup already exists against
+   the newly focused text input on *every* activation: dismiss, `set_parent`,
+   `new_popup` (`wayland/input_method/input_method_handle.rs:125-143`). So an
+   activation-scoped surface buys nothing. Worse, `set_text_input_rectangle`
+   only forwards to a popup that exists at the moment the text input updates
+   its cursor rectangle (`:103-121`), so a surface created inside `activate`
+   misses the rectangle that came with the activation and sits at a stale
+   position until the caret next moves. The one hazard of a long-lived surface
+   is covered: created before any field has focus, `get_parent()` is `None` and
+   smithay skips `new_popup` (`:272-274`), leaving it untracked — and the first
+   `activate` registers it anyway.
+
+3. **`UpdateLookupTable` carries the whole candidate list, and the page is
+   derived.** The daemon does no slicing at all
+   (`bus/inputcontext.c:2764-2777`); `cursor_pos` is a global index; the
+   visible page is `[cursor_pos / page_size * page_size, +page_size)` and the
+   highlighted row is `cursor_pos % page_size`
+   (`ui/gtk3/candidatepanel.vala:339-361`). The `_fast` engine call sends
+   **three** pages, not one, with `cursor_pos` renumbered window-relative
+   (`src/ibusengine.c:2065-2117`) — and the same formula is correct for that
+   too, so there is only one of it. (The "3 candidates, page 3" in the phase-1
+   trace is a formatting artefact: `LookupTable`'s `Display` prints `page_size`
+   after the word "page". mozc sets `page_size` to the candidate count for
+   small tables.)
+
+4. **Labels are indexed by slot within the page, not by candidate, and the
+   defaults fill absolutely.** The panel reads `get_label(i)` for
+   `i in 0..page_size` (`ui/gtk3/candidatepanel.vala:350-354`) and then fills
+   every remaining slot from a fixed table indexed by the same `i`
+   (`ui/gtk3/candidatearea.vala:112-118`) — so an engine that supplies three
+   labels gets `"4."`, `"5."`, … in slots 3 onward, not a continuation. The
+   table is `"1."`…`"9."`, then `"0."`, then `"a."`…`"f."`
+   (`ui/gtk3/candidatearea.vala:38-41`); the tenth candidate is `0` because
+   that is the key you press. Page size is capped at 16
+   (`src/ibuslookuptable.c:224`).
+
+5. **`PageUp`/`PageDown`/`CursorUp`/`CursorDown` carry no payload and are not
+   followed by a fresh table.** The daemon mutates its own copy and emits a
+   bare signal (`bus/inputcontext.c:2425` and neighbours), returning early
+   without emitting if the move fails. A client with `CAP_LOOKUP_TABLE` must
+   mirror `ibus_lookup_table_page_up` and friends
+   (`src/ibuslookuptable.c:434-518`) **exactly**, quirks included: the rounding
+   page-up computes `page_count * page_size + slot` and then clamps, so it
+   always lands on the last *candidate* rather than on the same slot of the
+   last page. Being bug-compatible is the only way to keep our cursor and the
+   daemon's in step, since neither side ever re-syncs.
+
+6. **`ShowLookupTable` and `ShowAuxiliaryText` are dead in IBus's own panel.**
+   `ui/gtk3/panel.vala` overrides only the `update_*` and `hide_*` methods, so
+   the base class routes the show requests to GObject signals nothing is
+   connected to (`src/ibuspanelservice.c:1474-1505`). Visibility there is
+   entirely the `visible` flag on `Update*` — and `update(table, false)` is
+   implemented as `set_lookup_table(null)`, i.e. identical to `hide`
+   (`ui/gtk3/panel.vala:2015-2023`). We honour the show signals anyway: it
+   costs a line, the daemon already suppresses a show that changes nothing
+   (`bus/inputcontext.c:2364-2366`), and the one sequence it rescues —
+   `update(table, false)` then `show()` — is silently broken upstream.
+   Auxiliary text with no candidates is a standalone window in the panel
+   (`ui/gtk3/candidatepanel.vala:427-444`), and here too; it is how mozc's
+   「Tabキーで選択」 appears.
+
+7. **`fc-match sans-serif:lang=ja` is the wrong way to pick the font.** On this
+   machine it answers *WenQuanYi Zen Hei*, a Chinese face whose kanji are the
+   Chinese glyph variants — no tofu, and still wrong. The renderer names its
+   preference list explicitly, Japanese first, and logs which family it got.
+
+8. **The harness was testing the wrong routing, silently.** mozc chooses its
+   candidate window at engine startup and the choice is environmental: it looks
+   at `WAYLAND_DISPLAY` and `XDG_CURRENT_DESKTOP` (both visible in the engine
+   binary's strings), and with `WAYLAND_DISPLAY` unset it concludes X11 and
+   drives its own `mozc_renderer`, emitting **no lookup tables at all**. The
+   scratch environment deliberately has no `WAYLAND_DISPLAY`, so every
+   candidate signal was missing and nothing said so. The fix is
+   `MOZC_IBUS_CANDIDATE_WINDOW=ibus` in the scratch environment, which forces
+   the IBus path — the same path the live session takes, where
+   `WAYLAND_DISPLAY` *is* set and COSMIC is not in
+   `compatible_wayland_desktop_names` (`["GNOME"]`) — without handing the
+   engine a compositor to reach. Worth carrying as a general hazard: an
+   engine's output can depend on environment the harness is deliberately
+   withholding.
+
+9. **cosmic-comp does not implement `wlr-screencopy`, so the screenshot gap is
+   not one an existing tool closes.** The nested compositor's registry
+   advertises `ext_image_copy_capture_manager_v1` with
+   `ext_output_image_capture_source_manager_v1` and
+   `zcosmic_workspace_image_capture_source_manager_v1`, and no
+   `zwlr_screencopy_manager_v1`. Nothing installed here speaks any of them:
+   `grim` (wlr-screencopy only) is absent, and `cosmic-screenshot` goes through
+   the xdg-desktop-portal Screenshot interface on the *live* session bus, which
+   the nested compositor's private bus cannot activate. Automating the visual
+   pass therefore means writing an `ext-image-copy-capture` client, which is a
+   piece of work rather than a missing package. Until then the candidate
+   window's appearance is checked two other ways: the renderer's unit tests
+   write PNGs of a fixture table, and a human looks at the nested compositor.
+
+10. **Redraws have to coalesce across a *burst* of signals, not just across
+    frames.** One keystroke through mozc produces `UpdateAuxiliaryText` and
+    `UpdateLookupTable` together, and committing produces `HideLookupTable`
+    then `HideAuxiliaryText`; each arrives as its own callback on the signal
+    channel. Painting from each one attached a buffer for a state nobody should
+    see — measured: committing a conversion drew a candidate-less window
+    containing only the auxiliary line, for the microseconds between the two
+    hide signals. Calloop's post-dispatch callback (the third argument to
+    `EventLoop::run`, previously `|_| {}`) runs after the whole burst and is the
+    right place to draw. Frame callbacks throttle on top of that.
+
+11. Minor: the popup's background is forced opaque even when the COSMIC theme
+    asks for translucency. COSMIC's own popovers are translucent *and blurred*,
+    and there is no blur available to a client on an input-popup surface, so
+    following the theme would mean candidate kana laid over whatever text is
+    behind them. Everything is drawn at buffer scale 1 — every output on this
+    machine is at scale 1.0, and doing it properly means tracking `wl_output`
+    through `wl_surface.enter` and repainting on a move. Both are noted rather
+    than solved, as is following the theme live: it is read once, at popup
+    creation.
+
+### What was verified, and how
+
+`scripts/im-harness/candidate-test.sh` is the phase-3 regression, all eight
+assertions green on 2026-08-27. It runs the frontend at debug level against the
+nested compositor and the scratch daemon, injects `konnnitiha`, space and Tab
+over libei, and asserts on the frontend's own log: a CJK font and a palette were
+chosen, the compositor delivered `text_input_rectangle`, mozc sent a visible
+table (nine candidates), a 194×288 buffer was attached and committed, moving the
+selection produced another table, the window was unmapped on commit, and the
+conversion reached the entry. The caret rectangle tracks the caret across the
+field as characters are typed, which is what confirms the popup is anchored to
+the caret rather than to the window.
+
+`cargo test` renders four PNGs of fixture tables — vertical, horizontal,
+auxiliary-only, and the same fixture through the *configured* theme rather than
+the fallback — under `$COSMIC_VOICE_RENDER_DIR` (default the temp dir), which is
+how the layout was iterated on without a compositor in the loop.
+
+`frontend-test.sh` and `switcher-test.sh` still pass unchanged.

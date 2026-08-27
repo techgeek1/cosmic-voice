@@ -57,6 +57,8 @@ use super::keyboard::{Keyboard, RepeatInfo, XKB_KEYCODE_OFFSET};
 use super::link::{Link, Upstream};
 use super::popup::Popup;
 use super::router::{self, KeyFacts, Route};
+use super::ImEvent;
+use super::switcher::Switcher;
 use crate::ibus::{ContextSignal, PREEDIT_COMMIT, PostRecord, RELEASE_MASK, Text, describe_state};
 
 /// How often the loop wakes up when it has nothing else to do.
@@ -79,6 +81,16 @@ pub struct Options {
     /// Permission to bind the display this process inherited, which is
     /// normally the user's live session. See [`run`] for why that is gated.
     pub allow_live  : bool,
+    /// Engine-switch accelerators in GTK syntax, overriding dconf. Empty means
+    /// "read `org.freedesktop.ibus.general.hotkey triggers`".
+    pub triggers    : Vec<String>,
+    /// The engine ids to cycle through, overriding dconf. Empty means "read
+    /// `preload-engines`, ordered by `engines-order`".
+    pub engines     : Vec<String>,
+    /// Where to publish [`ImEvent`]s. `None` means nobody is listening, which
+    /// is the state until phase 5 wires the applet up; the frontend logs them
+    /// either way.
+    pub events      : Option<std::sync::mpsc::Sender<ImEvent>>,
 }
 
 // --- State ---
@@ -210,6 +222,9 @@ pub struct Frontend {
 
     /// The connection to ibus-daemon and the context on it.
     link        : Link,
+    /// The panel duties: the registered engine-switch trigger and the cycle it
+    /// drives. A connection of its own, on its own retry clock.
+    switcher    : Switcher,
     /// Where the signal thread sends; cloned for each new context.
     signals     : channel::Sender<Upstream>,
 
@@ -244,7 +259,8 @@ pub fn run(options: Options) -> Result<()> {
         );
     }
 
-    match ibus_wayland_bridge() {
+    let bridge = ibus_wayland_bridge();
+    match bridge {
         Some(pid) if live => bail!(
             "ibus-ui-gtk3 --enable-wayland-im is running as pid {pid} and already holds this \
              seat's input method. Binding a second one wedges the keyboard session-wide.",
@@ -255,6 +271,23 @@ pub fn run(options: Options) -> Result<()> {
             options.display,
         ),
         None => {}
+    }
+
+    // The panel duties are a *second* exclusive role, and this is the check
+    // for it. A running `ibus-ui-gtk3` has already called
+    // `SetGlobalShortcutKeys` on the session's daemon, and the property is a
+    // last-writer-wins global with no unregister: registering over it would
+    // replace the live panel's trigger with ours while that panel is still the
+    // one acting on it. A nested display makes the *input-method* side
+    // harmless, but a daemon has no seats, so nothing makes this side
+    // harmless. An explicit address is the exception — it says the caller has
+    // a particular daemon in mind, which is the harness case.
+    let own_the_panel = options.ibus_address.is_some() || bridge.is_none();
+    if !own_the_panel {
+        tracing::warn!(
+            "not registering the engine-switch trigger: ibus-ui-gtk3 is already this daemon's \
+             panel, and the registration is global with no way to put it back"
+        );
     }
 
     let conn = connect(&options.display)?;
@@ -317,7 +350,14 @@ pub fn run(options: Options) -> Result<()> {
         repeat      : None,
         generation  : 0,
         last_key    : (0, Instant::now()),
-        link        : Link::new(options.ibus_address),
+        link        : Link::new(options.ibus_address.clone()),
+        switcher    : Switcher::new(
+            options.ibus_address,
+            options.triggers,
+            options.engines,
+            options.events,
+            own_the_panel,
+        ),
         signals     : sender,
         handle      : handle.clone(),
         stop        : event_loop.get_signal(),
@@ -339,6 +379,12 @@ pub fn run(options: Options) -> Result<()> {
             TimeoutAction::ToDuration(TICK)
         })
         .map_err(|e| anyhow!("registering the tick timer: {e}"))?;
+
+    // Before the loop rather than on its first tick: the trigger registration
+    // is what makes the switch hotkey do anything at all, and three seconds of
+    // it typing a space instead is three seconds of the user learning that it
+    // does not work.
+    frontend.switcher.ensure(&frontend.signals);
 
     // The closure runs after every dispatch, which is where the candidate
     // window draws: one keystroke through mozc produces a burst of signals and
@@ -520,11 +566,18 @@ impl Frontend {
         }
     }
 
-    /// Periodic work: nothing but reconnection.
+    /// Periodic work: reconnection, for both connections.
+    ///
+    /// The context is built only while a field has focus — creating one is
+    /// what makes the daemon start an engine for us. The panel connection has
+    /// no such cost and is made as soon as ibus-daemon is there, because the
+    /// registration is global and the sooner it exists the sooner the trigger
+    /// stops typing a space.
     fn on_tick(&mut self) {
         if self.active && self.link.context().is_none() {
             self.attach_context();
         }
+        self.switcher.ensure(&self.signals);
     }
 }
 
@@ -731,6 +784,15 @@ impl Frontend {
             Upstream::Signal(signal) => signal,
             Upstream::Lost           => {
                 self.link.lost("the signal stream ended");
+                return;
+            }
+            Upstream::Panel(signal)  => {
+                tracing::info!("  panel {signal}");
+                self.switcher.on_signal(signal);
+                return;
+            }
+            Upstream::PanelLost      => {
+                self.switcher.lost("the panel signal stream ended");
                 return;
             }
         };
