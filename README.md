@@ -22,7 +22,13 @@ machine.
   drive live preedit; offline passes of `parakeet-unified-en-0.6b` with hotword
   biasing produce the text that actually gets committed. Transducers also emit
   nothing during silence, which matters because push-to-talk brackets every
-  utterance with silence and whisper hallucinates there.
+  utterance with silence and whisper hallucinates there. The offline model is
+  English-only; the streaming one is multilingual and writes Japanese. So
+  when the offline pass returns nothing, or returns no CJK for speech the
+  streaming model wrote in CJK, the streaming hypothesis — the text you were
+  already watching as preedit — is what gets committed, without the trailing
+  space. (sherpa-onnx's Rust binding has no per-stream language hint for the
+  streaming model, so it runs in its automatic mode.)
 - **Long utterances are decoded as you speak them.** The offline pass costs
   more than linearly in audio length — measured here at four threads, 30s
   decodes at 0.052× real time but 120s at 0.093× — so waiting for the key to

@@ -16,6 +16,15 @@
 //! so swapping the streaming guess for the accurate result at the end is exactly
 //! the protocol's intended use rather than a workaround.
 //!
+//! One exception, decided in the engine (`engine::choose_final`): the offline
+//! model is English-only and the streaming one is multilingual, so Japanese
+//! speech comes back from the offline pass as nothing, or as English sounds.
+//! Then the streaming hypothesis is the commit. Measured before deciding to
+//! keep two models: on a 30s English recording the streaming final reads
+//! "keywacher … each own Fred on their own" where the offline pass is
+//! word-perfect, so the streaming model is not a candidate for the English
+//! commit.
+//!
 //! Neither recognizer is `Send`, and inference must never run on the engine's
 //! event loop, so each lives on a dedicated worker thread behind channels:
 //! [`spawn`] returns both plus the shared event stream. Each thread processes

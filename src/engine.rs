@@ -793,6 +793,13 @@ impl Engine {
         // Segments are cut at pauses, so a space is the right joint: the model
         // has already punctuated each one as a sentence would end.
         let text = self.seg_texts.join(" ");
+        let text = match choose_final(&text, &self.last_hyp) {
+            Final::Offline          => text,
+            Final::Streamed(reason) => {
+                tracing::info!("committing the streamed text: {reason}");
+                self.last_hyp.clone()
+            }
+        };
         self.abandon_utterance();
         self.commit(&text);
     }
@@ -861,7 +868,7 @@ impl Engine {
         }
 
         let mut out = text.to_owned();
-        if self.config.trailing_space {
+        if self.config.trailing_space && wants_trailing_space(text) {
             out.push(' ');
         }
 
@@ -919,5 +926,111 @@ impl Engine {
             _ => self.latest.lock().unwrap().state = Some(event.clone()),
         }
         let _ = self.events.send(event);
+    }
+}
+
+// --- Which text to commit ---
+
+/// The verdict of [`choose_final`].
+#[derive(Debug, PartialEq, Eq)]
+enum Final {
+    /// The offline pass's text, as designed.
+    Offline,
+    /// The streaming model's last hypothesis, with the reason it won.
+    Streamed(&'static str),
+}
+
+/// Decides between the offline pass and the streaming hypothesis.
+///
+/// The offline model is the accurate one and wins whenever it has an answer
+/// in the script the user spoke. The streaming model is the multilingual one:
+/// `nemotron-3.5-asr-streaming` writes Japanese, `parakeet-unified-en` has no
+/// CJK token at all, so on Japanese speech the offline pass returns nothing
+/// — or, worse, an English rendering of the sounds. Both cases are read here
+/// as "the offline model cannot write what was said", and the streaming text
+/// that the user has already been watching as preedit is committed instead.
+/// Two empty strings are silence, and stay the caller's problem.
+fn choose_final(offline: &str, streamed: &str) -> Final {
+    if streamed.trim().is_empty() {
+        return Final::Offline;
+    }
+    if offline.trim().is_empty() {
+        return Final::Streamed("the offline pass heard nothing where the streaming model heard text");
+    }
+    if has_cjk(streamed) && !has_cjk(offline) {
+        return Final::Streamed("the offline model cannot write the script the streaming model heard");
+    }
+
+    Final::Offline
+}
+
+/// Whether the text contains Han, kana or Hangul.
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
+/// Han, hiragana, katakana (including half-width), Hangul, and the CJK
+/// punctuation block. What "Japanese, Chinese or Korean" means for the two
+/// rules that need it.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3000}'..='\u{303F}'   // CJK symbols and punctuation
+        | '\u{3040}'..='\u{30FF}' // hiragana, katakana
+        | '\u{3400}'..='\u{4DBF}' // CJK extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
+        | '\u{AC00}'..='\u{D7AF}' // Hangul syllables
+        | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
+        | '\u{FF00}'..='\u{FFEF}' // half-width and full-width forms
+    )
+}
+
+/// Whether a committed utterance should get the configured trailing space.
+///
+/// Spaces separate words in Latin text and nothing in Japanese, where a space
+/// after 。 is a typo. Decided by the last character, which is the one the
+/// space would follow.
+fn wants_trailing_space(text: &str) -> bool {
+    text.chars().next_back().is_none_or(|last| !is_cjk(last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// English as designed: the offline pass is the accurate one.
+    #[test]
+    fn offline_wins_when_it_has_an_answer() {
+        assert_eq!(choose_final("The engine runs.", "the engine runs"), Final::Offline);
+    }
+
+    /// Silence stays silence; the streamed text does not resurrect nothing.
+    #[test]
+    fn two_empties_are_offline() {
+        assert_eq!(choose_final("", ""), Final::Offline);
+        assert_eq!(choose_final("", "  "), Final::Offline);
+    }
+
+    /// Japanese: the offline model has no token for it and returns nothing.
+    #[test]
+    fn streamed_wins_when_offline_is_empty() {
+        assert!(matches!(choose_final("", "こんにちは"), Final::Streamed(_)));
+    }
+
+    /// Japanese rendered as English sounds is still not an answer.
+    #[test]
+    fn streamed_wins_when_offline_cannot_write_the_script() {
+        assert!(matches!(choose_final("con each ewa", "こんにちは"), Final::Streamed(_)));
+        // Mixed input where the offline pass did write CJK is its call.
+        assert_eq!(choose_final("東京 station", "東京ステーション"), Final::Offline);
+    }
+
+    /// No space after Japanese; a space after everything else.
+    #[test]
+    fn trailing_space_follows_the_script() {
+        assert!(wants_trailing_space("Hello."));
+        assert!(wants_trailing_space(""));
+        assert!(!wants_trailing_space("こんにちは。"));
+        assert!(!wants_trailing_space("東京"));
+        assert!(wants_trailing_space("東京 station"));
     }
 }
