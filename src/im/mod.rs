@@ -21,6 +21,10 @@
 //!   keycode conventions that meet at it.
 //! - [`router`] — the routing rules, as a pure function with tests. The only
 //!   part of the leg that can be checked without a compositor.
+//! - [`dictation`] — turn-taking between the keyboard and the microphone, as a
+//!   second pure function with tests, plus the channel that carries it.
+//! - [`supervisor`] — keeping a frontend running inside the applet process,
+//!   and telling the applet when there is not one.
 //! - [`link`] — when to build an IBus context, and how its asynchronous signals
 //!   reach the loop.
 //! - [`switcher`] — the panel duties: parsing the engine-switch accelerators,
@@ -32,11 +36,13 @@
 //! - [`render`] — turning that state into pixels, with no Wayland in sight.
 //! - [`theme`] — where the candidate window's colours come from.
 //!
-//! # Not here yet
+//! # How dictation gets in
 //!
-//! Dictation turn-taking (phase 5). With phases 2 to 4 in place, typing
-//! through mozc, seeing its candidates and switching engines all work; what is
-//! missing is the half this subsystem exists for, which is voice.
+//! [`crate::engine`] never speaks Wayland. It hands text to a
+//! [`crate::sink::TextSink`], which either sends a [`dictation::DictationCmd`]
+//! down the link to this thread or falls back to [`crate::inject`]'s virtual
+//! keyboard, and it chooses between them by reading one flag this thread
+//! publishes. Nothing on either side ever blocks on the other.
 //!
 //! # Safety
 //!
@@ -49,16 +55,28 @@
 //! argument, refuses the one the process inherited unless explicitly told
 //! otherwise, and refuses outright if IBus's own Wayland bridge is running on
 //! that display. See `docs/multiplexer.md` for the full incident.
+//!
+//! [`supervisor::spawn`] is the one caller that does tell it otherwise, because
+//! owning the live seat's slot is the whole purpose of
+//! `input_method: Multiplexer`. The guard it overrides exists so that a
+//! *devtest* cannot reach this state by accident; what keeps the shipped path
+//! safe is the bridge check, which the supervisor makes again on its own
+//! before every attempt, and the fact that the mode has to be written into the
+//! config by hand after the autostart cutover.
 
 mod content_type;
+mod dictation;
 mod frontend;
 mod keyboard;
 mod link;
 mod popup;
 mod render;
 mod router;
+mod supervisor;
 mod switcher;
 mod theme;
 
+pub use dictation::{DictationCmd, DictationLink};
 pub use frontend::{Options, run};
+pub use supervisor::{Supervised, spawn};
 pub use switcher::ImEvent;

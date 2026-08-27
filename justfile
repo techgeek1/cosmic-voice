@@ -37,3 +37,13 @@ models:
 
 run:
     RUST_LOG=cosmic_voice=debug cargo run
+
+# Hand the seat's input-method slot from IBus to cosmic-voice. ATTENDED ONLY:
+# it rewrites one autostart line and prints the manual steps for the running
+# session. See README.md, "Multiplexer cutover".
+cutover:
+    scripts/cutover.sh
+
+# Give the slot back to IBus. Also attended, also one line plus instructions.
+rollback:
+    scripts/rollback.sh

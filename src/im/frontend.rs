@@ -52,12 +52,13 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 
+use super::ImEvent;
 use super::content_type::ContentType;
+use super::dictation::{self, DictationCmd, DictationLink, Op, Turn};
 use super::keyboard::{Keyboard, RepeatInfo, XKB_KEYCODE_OFFSET};
 use super::link::{Link, Upstream};
 use super::popup::Popup;
 use super::router::{self, KeyFacts, Route};
-use super::ImEvent;
 use super::switcher::Switcher;
 use crate::ibus::{ContextSignal, PREEDIT_COMMIT, PostRecord, RELEASE_MASK, Text, describe_state};
 
@@ -87,10 +88,21 @@ pub struct Options {
     /// The engine ids to cycle through, overriding dconf. Empty means "read
     /// `preload-engines`, ordered by `engines-order`".
     pub engines     : Vec<String>,
-    /// Where to publish [`ImEvent`]s. `None` means nobody is listening, which
-    /// is the state until phase 5 wires the applet up; the frontend logs them
-    /// either way.
-    pub events      : Option<std::sync::mpsc::Sender<ImEvent>>,
+    /// Where to publish [`ImEvent`]s. `None` means nobody is listening — the
+    /// devtest's default — and the frontend logs them either way.
+    ///
+    /// Unbounded because the sender is this thread and the receiver is the
+    /// dictation engine's tokio loop: a bounded channel would let a busy
+    /// applet stall the loop that is servicing the keyboard grab.
+    pub events      : Option<tokio::sync::mpsc::UnboundedSender<ImEvent>>,
+    /// The dictation engine's end of the turn-taking channel. `None` means
+    /// nothing dictates through this frontend, which is what a harness run
+    /// without `--dictation-fifo` is.
+    ///
+    /// The frontend creates the channel — a calloop channel belongs to the
+    /// loop that polls it — and hands the sending end back through this link,
+    /// which outlives any one frontend. See [`super::dictation`].
+    pub dictation   : Option<DictationLink>,
 }
 
 // --- State ---
@@ -228,6 +240,12 @@ pub struct Frontend {
     /// Where the signal thread sends; cloned for each new context.
     signals     : channel::Sender<Upstream>,
 
+    /// Whose turn it is: the keyboard's, or the microphone's.
+    turn        : Turn,
+    /// The dictation engine's link, so activation changes can be published to
+    /// it. `None` when nothing dictates through this frontend.
+    dictation   : Option<DictationLink>,
+
     /// For scheduling repeat timers.
     handle      : LoopHandle<'static, Frontend>,
     /// For stopping the loop when the input method is taken away.
@@ -318,6 +336,12 @@ pub fn run(options: Options) -> Result<()> {
     // thing to reason about on a connection whose lifetime is the process's.
     let im = im_manager.get_input_method(&seat, &qh, ());
     tracing::info!("input method bound on {}", options.display);
+    // Announced from here rather than from the supervisor because this is the
+    // line the state is true from: everything above can still fail, and
+    // nothing below binds anything exclusive.
+    if let Some(events) = options.events.as_ref() {
+        let _ = events.send(ImEvent::Bound);
+    }
 
     // Created here rather than per activation: smithay re-parents an existing
     // popup on every `activate`, and only delivers the caret rectangle to a
@@ -359,6 +383,8 @@ pub fn run(options: Options) -> Result<()> {
             own_the_panel,
         ),
         signals     : sender,
+        turn        : Turn::default(),
+        dictation   : options.dictation.clone(),
         handle      : handle.clone(),
         stop        : event_loop.get_signal(),
     };
@@ -380,6 +406,23 @@ pub fn run(options: Options) -> Result<()> {
         })
         .map_err(|e| anyhow!("registering the tick timer: {e}"))?;
 
+    // The engine's commands. Created here rather than by the caller because a
+    // calloop channel is owned by the loop that polls it, and the loop is
+    // this one; the link the caller passed is how the sending end gets back
+    // out to a thread that outlives this loop.
+    if let Some(link) = options.dictation.as_ref() {
+        let (commands, receiver) = channel::channel::<DictationCmd>();
+        handle
+            .insert_source(receiver, |event, _, frontend| {
+                if let channel::Event::Msg(command) = event {
+                    frontend.on_dictation(command);
+                }
+            })
+            .map_err(|e| anyhow!("registering the dictation channel: {e}"))?;
+        link.attach(commands);
+        link.status().set_bound(true);
+    }
+
     // Before the loop rather than on its first tick: the trigger registration
     // is what makes the switch hotkey do anything at all, and three seconds of
     // it typing a space instead is three seconds of the user learning that it
@@ -390,13 +433,23 @@ pub fn run(options: Options) -> Result<()> {
     // window draws: one keystroke through mozc produces a burst of signals and
     // this is the point at which all of them have been applied. See
     // [`Popup::flush`].
-    event_loop
+    let outcome = event_loop
         .run(None, &mut frontend, |frontend| {
             if let Some(popup) = frontend.popup.as_mut() {
                 popup.flush();
             }
         })
-        .context("running the event loop")?;
+        .context("running the event loop");
+
+    // Whatever ended the loop, the engine must stop believing there is an
+    // input method behind it before this function returns: the supervisor's
+    // next attempt is a *new* loop with a new channel, and a stale sender
+    // would swallow an utterance in the gap.
+    if let Some(link) = options.dictation.as_ref() {
+        link.status().set_bound(false);
+        link.detach();
+    }
+    outcome?;
 
     Ok(())
 }
@@ -428,7 +481,7 @@ fn connect(display: &str) -> Result<Connection> {
 /// no way to ask: the protocol has no "who holds this" query, and the only
 /// probe available — binding it — is the thing that breaks. The cmdline is
 /// NUL-separated, so `--enable-wayland-im` is matched as a whole argument.
-fn ibus_wayland_bridge() -> Option<u32> {
+pub(super) fn ibus_wayland_bridge() -> Option<u32> {
     let entries = std::fs::read_dir("/proc").ok()?;
     for entry in entries.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
@@ -470,6 +523,13 @@ impl Frontend {
 
         let was_active = self.active;
         self.active = self.pending.active;
+        // Published before anything is done about it: this is the flag the
+        // dictation engine reads to choose between the preedit path and the
+        // virtual keyboard, and it must never claim a field we have already
+        // lost. See [`super::dictation`].
+        if let Some(link) = self.dictation.as_ref() {
+            link.status().set_active(self.active);
+        }
         self.surrounding = self.pending.surrounding.clone();
         self.change_cause = self.pending.change_cause;
         let content_changed = self.content != self.pending.content;
@@ -530,6 +590,14 @@ impl Frontend {
         // commit into and the compositor would give the text to the next one.
         // Called anyway so the rule lives in one place: see the method.
         self.flush_held_preedit();
+
+        // The microphone's turn ends with the field it was writing into. The
+        // engine sees the same deactivation through the status flags and
+        // finishes the utterance on the virtual keyboard; leaving the router
+        // in `Dictating` would mean a partial landing as a preedit in
+        // whatever field focus moves to next, on top of the text the fallback
+        // has already typed there.
+        self.turn = Turn::Forwarding;
 
         self.with_context("Reset", |context| context.reset());
         self.with_context("FocusOut", |context| context.focus_out());
@@ -896,6 +964,50 @@ impl Frontend {
         tracing::info!("committing held preedit {:?}", preedit.text);
         self.im.commit_string(preedit.text);
         self.im.commit(self.serial);
+    }
+
+    /// Takes one command from the dictation engine.
+    ///
+    /// The decision is [`dictation::advance`]'s and the whole of it; this is
+    /// the part that knows which protocol requests each answer means. Keys
+    /// keep flowing to IBus throughout — a key pressed mid-utterance is rare,
+    /// and swallowing it is worse than letting it through.
+    fn on_dictation(&mut self, command: DictationCmd) {
+        let (turn, ops) = dictation::advance(self.turn, &command, self.active);
+        tracing::info!(
+            "dictation {command:?} ({:?} -> {turn:?}, {} op{})",
+            self.turn,
+            ops.len(),
+            if ops.len() == 1 { "" } else { "s" },
+        );
+        self.turn = turn;
+
+        for op in ops {
+            self.apply_dictation(op);
+        }
+    }
+
+    /// Performs one turn-taking operation.
+    fn apply_dictation(&mut self, op: Op) {
+        match op {
+            Op::Flush          => self.flush_held_preedit(),
+            Op::Reset          => self.with_context("Reset", |context| context.reset()),
+            Op::Preedit(text)  => {
+                let caret = text.chars().count() as u32;
+                self.set_preedit(&text, caret, true, None);
+            }
+            // Written out rather than routed through `commit_text` so that the
+            // preedit clear and the commit ride in one double-buffered update.
+            // A commit alone would clear the preedit too (phase-2 finding 9),
+            // but relying on that leaves the intent invisible in the one place
+            // where the text on screen is being replaced wholesale.
+            Op::Commit(text)   => {
+                self.im.set_preedit_string(String::new(), 0, 0);
+                self.im.commit_string(text);
+                self.im.commit(self.serial);
+                self.preedit = None;
+            }
+        }
     }
 
     /// Deletes text around the caret on the engine's behalf.

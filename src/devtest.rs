@@ -43,7 +43,8 @@ pub fn run(args: &[String]) -> Result<()> {
             "checks: decode <model_dir> <wav> [threads] | stream <model_dir> <wav> [threads] | \
              finalize <model_dir> <wav> [threads] | capture <secs> | keys | rebind | \
              inject-probe | type <secs> <text> | ibus-info | ibus-keys <engine> <key>… | \
-             im-frontend <wayland-display> [ibus-address] [--config <path>]"
+             im-frontend <wayland-display> [ibus-address] [--config <path>] \
+             [--dictation-fifo <path>]"
         )),
     }
 }
@@ -526,10 +527,17 @@ fn parse_key_spec(spec: &str) -> Result<(u32, u32)> {
 /// the user's dconf says. Without it the user's own config is used, so
 /// `ibus_triggers` and `ibus_engines` mean the same thing here as they will in
 /// the shipped applet.
+///
+/// `--dictation-fifo <path>` stands in for the microphone. Newline-delimited
+/// JSON [`crate::im::DictationCmd`]s read from the fifo are fed into the
+/// frontend exactly as the dictation engine would feed them, which is what
+/// lets a shell script exercise turn-taking against a real mozc with no audio
+/// and no recogniser. See `scripts/im-harness/dictation-test.sh`.
 fn im_frontend(args: &[String]) -> Result<()> {
     let mut display = None;
     let mut address = None;
     let mut config_path = None;
+    let mut fifo_path = None;
     let mut allow_live = false;
     let mut arguments = args.iter();
     while let Some(argument) = arguments.next() {
@@ -543,6 +551,14 @@ fn im_frontend(args: &[String]) -> Result<()> {
                         .clone(),
                 );
             }
+            "--dictation-fifo"     => {
+                fifo_path = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--dictation-fifo needs a path"))?
+                        .clone(),
+                );
+            }
             _ if display.is_none() => display = Some(argument.clone()),
             _ if address.is_none() => address = Some(argument.clone()),
             other                  => return Err(anyhow!("unexpected argument {other:?}")),
@@ -552,7 +568,7 @@ fn im_frontend(args: &[String]) -> Result<()> {
     let Some(display) = display else {
         return Err(anyhow!(
             "usage: cosmic-voice devtest im-frontend <wayland-display> [ibus-address] \
-             [--config <path>]"
+             [--config <path>] [--dictation-fifo <path>]"
         ));
     };
 
@@ -560,10 +576,23 @@ fn im_frontend(args: &[String]) -> Result<()> {
         Some(path) => {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {path}"))?;
-            ron::from_str::<crate::config::Config>(&text)
-                .with_context(|| format!("parsing {path}"))?
+            let mut config = ron::from_str::<crate::config::Config>(&text)
+                .with_context(|| format!("parsing {path}"))?;
+            // The same fold `Config::load` does, so a fixture file means the
+            // same thing here as the user's own config does in the applet.
+            config.migrate();
+            config
         }
         None => crate::config::Config::load(),
+    };
+
+    let dictation = match fifo_path {
+        Some(path) => {
+            let link = crate::im::DictationLink::new();
+            spawn_dictation_fifo(path, link.clone())?;
+            Some(link)
+        }
+        None => None,
     };
 
     crate::im::run(crate::im::Options {
@@ -573,7 +602,61 @@ fn im_frontend(args: &[String]) -> Result<()> {
         triggers    : config.ibus_triggers,
         engines     : config.ibus_engines,
         events      : None,
+        dictation   : dictation,
     })
+}
+
+/// Reads dictation commands off a fifo and feeds them to the frontend.
+///
+/// On its own thread because opening a fifo for reading blocks until somebody
+/// opens the write end, and every read after the last writer closes returns
+/// end-of-file rather than blocking — so the loop reopens. That reopen is what
+/// makes `echo … > fifo` work as one command per line from a shell script,
+/// which is the whole interface: each `echo` is a writer that opens, writes
+/// and closes.
+///
+/// The fifo has to exist already. Creating it here would race the script that
+/// is about to write to it, and `mkfifo` in the script is one line.
+fn spawn_dictation_fifo(path: String, link: crate::im::DictationLink) -> Result<()> {
+    use std::io::BufRead;
+
+    if !std::path::Path::new(&path).exists() {
+        return Err(anyhow!("{path} does not exist; create it with mkfifo first"));
+    }
+
+    std::thread::Builder::new()
+        .name("dictation-fifo".to_string())
+        .spawn(move || {
+            loop {
+                match std::fs::File::open(&path) {
+                    Ok(file) => {
+                        for line in std::io::BufReader::new(file).lines() {
+                            let Ok(line) = line else { break };
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            match serde_json::from_str::<crate::im::DictationCmd>(line) {
+                                Ok(command) => link.send(command),
+                                Err(e)      => {
+                                    tracing::error!("dictation fifo: {line:?} is not a command: {e}")
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("dictation fifo {path}: {e}");
+                        return;
+                    }
+                }
+                // A regular file would otherwise reopen at end-of-file
+                // forever; a fifo blocks in `open` and never reaches this.
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .context("spawning the dictation fifo reader")?;
+
+    Ok(())
 }
 
 /// Indents a multi-line block for the report layout.

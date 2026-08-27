@@ -17,10 +17,12 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::asr::{AsrEvent, OfflineCmd, StreamCmd};
 use crate::audio::Capture;
-use crate::config::{Config, FallbackPartials};
+use crate::config::{Config, FallbackPartials, InputMethod};
 use crate::hotkey::{HotkeyEvent, KeyEdge, Watcher};
-use crate::inject::{Injector, common_prefix_len};
-use crate::ipc::{Command, Event};
+use crate::im::{DictationLink, ImEvent};
+use crate::inject::common_prefix_len;
+use crate::ipc::{Command, Event, ImEngine, InputMethodState};
+use crate::sink::TextSink;
 use crate::transcript_log;
 use crate::vad::{SegmentGate, SilenceGate};
 
@@ -164,6 +166,43 @@ async fn run_mirror(
     }
 }
 
+/// Starts the input-method thread, in the one process that may run it.
+///
+/// Only the primary reaches here: [`Engine::create`] is called by the holder
+/// of the flock, and every other applet instance is a mirror that never
+/// constructs an engine at all. That is the enforcement — a seat has one
+/// input-method slot and the panel spawns one applet per output, so "the
+/// mirrors must not bind" is not a rule anybody has to remember.
+///
+/// Returns the engine's end of the turn-taking link and the frontend's event
+/// stream, or `(None, None)` when the config leaves the slot alone.
+fn start_input_method(
+    config: &Config,
+) -> (Option<DictationLink>, Option<mpsc::UnboundedReceiver<ImEvent>>) {
+    if config.input_method != InputMethod::Multiplexer {
+        return (None, None);
+    }
+
+    let Ok(display) = std::env::var("WAYLAND_DISPLAY") else {
+        tracing::error!(
+            "input_method: Multiplexer needs a Wayland session; WAYLAND_DISPLAY is unset"
+        );
+        return (None, None);
+    };
+
+    let link = DictationLink::new();
+    let (events, receiver) = mpsc::unbounded_channel::<ImEvent>();
+    crate::im::spawn(crate::im::Supervised {
+        display  : display,
+        triggers : config.ibus_triggers.clone(),
+        engines  : config.ibus_engines.clone(),
+        dictation: link.clone(),
+        events   : events,
+    });
+
+    (Some(link), Some(receiver))
+}
+
 // --- Engine ---
 
 /// Owns every subsystem and the state machine that sequences them.
@@ -191,8 +230,16 @@ struct Engine {
     offline    : std::sync::mpsc::Sender<OfflineCmd>,
     /// Results out of both recogniser threads.
     asr_events : mpsc::UnboundedReceiver<AsrEvent>,
-    /// Wayland text injection.
-    inject     : Injector,
+    /// Wayland text output, over whichever path the focus and the config
+    /// allow.
+    sink       : TextSink,
+    /// What the input-method thread has told us, folded into the one state the
+    /// popup renders. Owned here rather than in the applet so that mirrors get
+    /// it through the snapshot like everything else.
+    im_state   : InputMethodState,
+    /// The input-method thread's events, taken by [`Engine::run`] so the
+    /// select loop can hold them without borrowing `self` twice.
+    im_events  : Option<mpsc::UnboundedReceiver<ImEvent>>,
     /// Trailing-silence detector for press-once mode.
     vad        : SilenceGate,
     /// Pause detector that cuts a long utterance into decodable segments.
@@ -239,15 +286,22 @@ impl Engine {
     /// usable once [`AsrEvent::Ready`] arrives.
     fn create(config: Config, events: broadcast::Sender<Event>) -> Result<Self> {
         let capture = Capture::start(config.preroll_ms).context("starting audio capture")?;
-        let inject = Injector::connect(config.bind_input_method)
-            .context("connecting the injector")?;
-        tracing::info!("injector ready, input method: {}", inject.im_status());
+        let (link, im_events) = start_input_method(&config);
+        let sink = TextSink::connect(&config, link)?;
+        tracing::info!("text output ready: {}", sink.status());
         let asr = crate::asr::spawn(&config);
 
+        let im_state = match config.input_method {
+            InputMethod::Off         => InputMethodState::Off,
+            InputMethod::Multiplexer => InputMethodState::Stopped {
+                reason: "starting up".to_owned(),
+            },
+        };
         let snapshot = crate::ipc::Snapshot {
-            state   : None,
-            logging : config.log_transcripts,
-            trigger : config.trigger_code,
+            state        : None,
+            logging      : config.log_transcripts,
+            trigger      : config.trigger_code,
+            input_method : im_state.clone(),
         };
 
         Ok(Self {
@@ -276,7 +330,9 @@ impl Engine {
             asr        : asr.stream,
             offline    : asr.offline,
             asr_events : asr.events,
-            inject     : inject,
+            sink       : sink,
+            im_state   : im_state,
+            im_events  : im_events,
             events     : events,
             latest     : std::sync::Arc::new(std::sync::Mutex::new(snapshot)),
         })
@@ -312,6 +368,10 @@ impl Engine {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Out of `self` for the duration of the loop: `select!` builds every
+        // arm's future at once, and two of them cannot both borrow `self`.
+        let mut im_events = self.im_events.take();
+
         loop {
             tokio::select! {
                 evt = keys.recv() => match evt {
@@ -331,6 +391,20 @@ impl Engine {
                 evt = self.asr_events.recv() => match evt {
                     Some(evt) => self.on_asr(evt),
                     None      => anyhow::bail!("recogniser thread died"),
+                },
+                // `pending()` when there is no input-method thread, so the arm
+                // simply never fires rather than needing a guard that would
+                // borrow `self` a second time.
+                evt = async {
+                    match im_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None         => std::future::pending().await,
+                    }
+                } => match evt {
+                    Some(evt) => self.on_im_event(evt),
+                    // The supervisor thread is gone, which it only is if the
+                    // process is shutting down.
+                    None      => im_events = None,
                 },
                 _ = tick.tick(), if matches!(self.state, State::Recording { .. }) => {
                     self.on_tick();
@@ -393,7 +467,7 @@ impl Engine {
         }
         // Segments still in the offline model are dropped on arrival because
         // the sequence has moved on; see `on_segment`.
-        let _ = self.inject.preedit("");
+        self.sink.cancel();
         self.abandon_utterance();
         self.state = State::Idle;
         self.emit(Event::Disabled);
@@ -434,6 +508,46 @@ impl Engine {
         self.emit(if self.enabled { Event::Idle } else { Event::Disabled });
     }
 
+    /// Folds one input-method event into the state the popup renders.
+    ///
+    /// The two producers say different things about the same subject — the
+    /// switcher knows which engine is in effect, the supervisor knows whether
+    /// a frontend is running — so the engine keeps one state and each event
+    /// updates the part it knows about. An `EngineChanged` while blocked, for
+    /// instance, cannot happen, but an `EngineChanged` arriving one event
+    /// before `Bound` can, and the engine is the only place that can hold both
+    /// halves.
+    fn on_im_event(&mut self, event: ImEvent) {
+        let state = match event {
+            ImEvent::EngineChanged { name, symbol, longname } => {
+                InputMethodState::Running {
+                    engine: Some(ImEngine {
+                        name    : name,
+                        symbol  : symbol,
+                        longname: longname,
+                    }),
+                }
+            }
+            // Keep whichever engine we already knew about: binding says
+            // nothing about the daemon, and losing the name would blank the
+            // status line for as long as the engine stays unchanged.
+            ImEvent::Bound => InputMethodState::Running {
+                engine: match &self.im_state {
+                    InputMethodState::Running { engine } => engine.clone(),
+                    _                                    => None,
+                },
+            },
+            ImEvent::Blocked { reason } => InputMethodState::Blocked { reason: reason },
+            ImEvent::Stopped { reason } => InputMethodState::Stopped { reason: reason },
+        };
+
+        if state == self.im_state {
+            return;
+        }
+        self.im_state = state.clone();
+        self.emit(Event::InputMethod { state: state });
+    }
+
     /// Switches transcript logging.
     fn set_logging(&mut self, enabled: bool) {
         if self.logging == enabled {
@@ -458,6 +572,10 @@ impl Engine {
         self.vk_typed.clear();
         self.last_hyp.clear();
         let _ = self.asr.send(StreamCmd::Reset);
+        // Before the first partial, so the input method has finished whatever
+        // conversion the keyboard left open and reset its engine by the time
+        // one arrives. On the virtual-keyboard path this is a no-op.
+        self.sink.begin();
 
         self.state = State::Recording { held: held };
         self.emit(Event::Recording { elapsed_ms: 0 });
@@ -550,7 +668,7 @@ impl Engine {
     fn cancel(&mut self) {
         // Clear any preedit the partials put up. Best effort; the compositor
         // clears it anyway when focus moves.
-        let _ = self.inject.preedit("");
+        self.sink.cancel();
 
         self.abandon_utterance();
         self.state = State::Idle;
@@ -564,6 +682,7 @@ impl Engine {
                 tracing::info!("models loaded");
                 self.emit(Event::Logging { enabled: self.logging });
                 self.emit(Event::Trigger { code: self.config.trigger_code });
+                self.emit(Event::InputMethod { state: self.im_state.clone() });
                 self.emit(if self.enabled { Event::Idle } else { Event::Disabled });
             }
             AsrEvent::LoadFailed(reason) => {
@@ -626,7 +745,7 @@ impl Engine {
     /// Routes provisional text to whichever display the focus allows.
     fn show_partial(&mut self, text: &str) {
         // Preedit first: free revision, replaced wholesale at commit.
-        match self.inject.preedit(text) {
+        match self.sink.preedit(text) {
             Ok(true)  => return,
             Ok(false) => {}
             Err(e)    => {
@@ -668,7 +787,7 @@ impl Engine {
         if let Some(tail) = stable.strip_prefix(self.vk_typed.as_str())
             && !tail.is_empty()
         {
-            if let Err(e) = self.inject.type_text(tail) {
+            if let Err(e) = self.sink.type_text(tail) {
                 tracing::warn!("typing stable prefix failed: {e:#}");
                 return;
             }
@@ -680,7 +799,7 @@ impl Engine {
     fn commit(&mut self, text: &str) {
         if text.is_empty() {
             // Silence in, nothing out. Clear any provisional text.
-            let _ = self.inject.preedit("");
+            self.sink.cancel();
             self.state = State::Idle;
             self.emit(Event::Idle);
             return;
@@ -691,13 +810,13 @@ impl Engine {
             out.push(' ');
         }
 
-        let injected = match self.inject.commit_im(&out) {
+        let injected = match self.sink.commit(&out) {
             Ok(true)  => Ok(()),
             Ok(false) => {
                 // Virtual-keyboard path: emit whatever the stable prefix has
                 // not already typed. Divergence keeps the streamed text.
                 match out.strip_prefix(self.vk_typed.as_str()) {
-                    Some(tail) => self.inject.type_text(tail),
+                    Some(tail) => self.sink.type_text(tail),
                     None       => {
                         tracing::info!(
                             "final diverges from typed prefix; keeping streamed text"
@@ -739,6 +858,9 @@ impl Engine {
             Event::Partial { .. }       => {}
             Event::Logging { enabled }  => self.latest.lock().unwrap().logging = *enabled,
             Event::Trigger { code }     => self.latest.lock().unwrap().trigger = *code,
+            Event::InputMethod { state } => {
+                self.latest.lock().unwrap().input_method = state.clone();
+            }
             _ => self.latest.lock().unwrap().state = Some(event.clone()),
         }
         let _ = self.events.send(event);

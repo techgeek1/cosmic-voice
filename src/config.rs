@@ -29,14 +29,28 @@ pub struct Config {
     /// Hard cap on a single utterance, in seconds. Also the backstop for a
     /// release event lost across a keyboard reconnect in hold mode.
     pub max_utterance_s     : u32,
-    /// Whether to bind `zwp_input_method_v2` for the preedit fast path.
+    /// Who owns the seat's `zwp_input_method_v2` slot.
     ///
-    /// **Off by default, deliberately.** Binding the seat's single input-method
-    /// slot while IBus runs its Wayland IM (`ibus-ui-gtk3 --enable-wayland-im`)
-    /// wedged cosmic-comp's keyboard routing and killed all text input
-    /// session-wide — recovery required killing IBus. Enable this only after
-    /// deciding who owns the slot; with it off, injection is virtual-keyboard
-    /// only and no other IME is ever contended.
+    /// **`Off` by default, deliberately.** A seat has one input-method slot
+    /// and no way to share it, and binding it while somebody else holds it
+    /// does not fail cleanly on cosmic-comp — it wedges keyboard input
+    /// session-wide (`docs/multiplexer.md`). The mode is therefore an explicit
+    /// choice, made once, after the autostart cutover.
+    pub input_method        : InputMethod,
+    /// The setting `input_method` replaced. Accepted for one release.
+    ///
+    /// `true` meant "bind the slot from the injector" — the path that caused
+    /// the 2026-08 incident. It is *not* read as a request for
+    /// [`InputMethod::Multiplexer`]: an old flag must never activate an
+    /// exclusive seat resource on its own, so it is warned about and ignored,
+    /// and the mode stays whatever `input_method` says. See
+    /// [`Config::migrate`].
+    ///
+    /// A plain `bool` rather than an `Option<bool>` because RON spells an
+    /// optional field `Some(true)` and the config files this exists to keep
+    /// working spell it `true`. Never serialised, so the next config the
+    /// applet writes has only the new key.
+    #[serde(default, skip_serializing)]
     pub bind_input_method   : bool,
     /// Append one space after each committed utterance, so consecutive
     /// dictations do not run together.
@@ -148,6 +162,7 @@ impl Default for Config {
             preroll_ms          : 750,
             silence_ms          : 700,
             max_utterance_s     : 120,
+            input_method        : InputMethod::Off,
             bind_input_method   : false,
             trailing_space      : true,
             default_hotwords    : Vec::new(),
@@ -176,8 +191,11 @@ impl Config {
     pub fn load() -> Self {
         let path = config_path();
         match std::fs::read_to_string(&path) {
-            Ok(text) => match ron::from_str(&text) {
-                Ok(config) => config,
+            Ok(text) => match ron::from_str::<Self>(&text) {
+                Ok(mut config) => {
+                    config.migrate();
+                    config
+                }
                 Err(e)     => {
                     tracing::warn!("{}: {e}; using defaults", path.display());
                     Self::default()
@@ -193,6 +211,32 @@ impl Config {
         }
     }
 
+    /// Retires old settings, once, at load.
+    ///
+    /// Kept as its own step rather than done in a `Deserialize` impl because
+    /// it warns: a setting that quietly changes meaning between releases is
+    /// how a user ends up with an input method they did not ask for, and the
+    /// one this retires used to own an exclusive seat resource.
+    ///
+    /// Deliberately not a mapping. `bind_input_method: true` could be read as
+    /// the older spelling of `input_method: Multiplexer`, and doing so would
+    /// even be safer than what the flag used to do — but the multiplexer needs
+    /// the autostart cutover first, and the setting that turns it on should be
+    /// the one the cutover instructions name, written by the person doing it.
+    /// So the flag is dropped with a warning and the mode is whatever
+    /// `input_method` says.
+    pub fn migrate(&mut self) {
+        if !std::mem::take(&mut self.bind_input_method) {
+            return;
+        }
+
+        tracing::warn!(
+            "config: bind_input_method is retired and ignored; the input method stays {:?}. \
+             Set `input_method: Multiplexer` after the cutover — see the README",
+            self.input_method
+        );
+    }
+
     /// Records a new trigger key in the config file.
     ///
     /// Re-reads the file rather than writing the in-memory copy, so anything
@@ -206,6 +250,10 @@ impl Config {
                 .with_context(|| format!("{} is malformed; not overwriting it", path.display()))?,
             Err(_)   => Self::default(),
         };
+        // Before the write, not after: the retired key is not serialised, so a
+        // rebind on a config that still spells the mode the old way would
+        // erase the user's input-method choice on its way past.
+        config.migrate();
         config.trigger_code = code;
 
         let tmp = path.with_extension("ron.tmp");
@@ -226,6 +274,27 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// Who owns the seat's input-method slot, and therefore where dictated text
+/// goes when a text field has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputMethod {
+    /// Nothing here binds `zwp_input_method_v2`. Dictation is typed through
+    /// the virtual keyboard, IBus keeps its own Wayland bridge, and the two
+    /// never meet.
+    ///
+    /// The default, and the behaviour every release before the multiplexer
+    /// shipped had.
+    Off,
+    /// This process owns the slot and multiplexes it: IBus's engines drive it
+    /// while the user types, dictation drives it while the user talks.
+    ///
+    /// Requires the autostart cutover — `ibus start` instead of `ibus start
+    /// --type wayland` — because two processes cannot hold the slot and the
+    /// applet refuses to try. With it set but the cutover not done, the applet
+    /// says so in its popup and keeps working on the virtual-keyboard path.
+    Multiplexer,
 }
 
 /// Behaviour for live text on clients that cannot accept preedit.

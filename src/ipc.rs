@@ -69,6 +69,61 @@ pub enum Event {
     /// The trigger key in effect: at startup, after a rebind, or reported to
     /// a new subscriber. Orthogonal to the capture state.
     Trigger { code: u16 },
+    /// Where the input-method multiplexer is. Orthogonal to the capture state
+    /// as well: dictation works in every one of these, only the path changes.
+    InputMethod { state: InputMethodState },
+}
+
+/// What the input-method multiplexer is doing, as the popup renders it.
+///
+/// This exists because the two things that can go wrong with owning a seat's
+/// input-method slot are both invisible otherwise. IBus's bridge still holding
+/// it is a log line nobody reads and a preedit that silently never appears;
+/// the frontend dying is the same. Both are states the user has to be told
+/// about, in a sentence, in the place they already look when dictation
+/// behaves oddly.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum InputMethodState {
+    /// `input_method: Off`. Nothing binds the slot; dictation types.
+    #[default]
+    Off,
+    /// Configured, but the slot belongs to somebody else. The reason names
+    /// them and says what to do about it.
+    Blocked { reason: String },
+    /// Bound and running. `engine` is the IBus engine in effect, once the
+    /// daemon has said which one it is.
+    Running { engine: Option<ImEngine> },
+    /// The frontend stopped and the supervisor is backing off before its next
+    /// attempt. Dictation is on the virtual-keyboard path meanwhile.
+    Stopped { reason: String },
+}
+
+/// The IBus engine in effect, for the status line.
+///
+/// Three strings because the daemon gives three and each is right in a
+/// different place: `name` is what a config file spells (`mozc-jp`), `symbol`
+/// is what a status area shows (`あ`), and `longname` is what a human calls it
+/// (`Mozc`). The panel wants the last two and falls back to the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImEngine {
+    /// Engine id, e.g. `mozc-jp`.
+    pub name    : String,
+    /// Short status-area symbol, e.g. `あ`. Often empty for xkb engines.
+    pub symbol  : String,
+    /// Human-readable name, e.g. `Mozc`.
+    pub longname: String,
+}
+
+impl std::fmt::Display for ImEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = if self.longname.is_empty() { &self.name } else { &self.longname };
+        write!(f, "{label}")?;
+        if !self.symbol.is_empty() {
+            write!(f, " {}", self.symbol)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Returns the socket path, `$XDG_RUNTIME_DIR/cosmic-voice.sock`.
@@ -135,11 +190,14 @@ pub fn send_blocking(cmd: Command) -> Result<()> {
 #[derive(Debug, Default)]
 pub struct Snapshot {
     /// Most recent capture-state event.
-    pub state   : Option<Event>,
+    pub state        : Option<Event>,
     /// Whether transcript logging is on.
-    pub logging : bool,
+    pub logging      : bool,
     /// The trigger key in effect.
-    pub trigger : u16,
+    pub trigger      : u16,
+    /// Where the input-method multiplexer is. Only the primary runs a
+    /// frontend, so this is the only way a mirror can know.
+    pub input_method : InputMethodState,
 }
 
 /// The engine's snapshot, shared with the control socket.
@@ -180,14 +238,21 @@ pub async fn serve(
                             Ok(Command::Subscribe) if rx.is_none() => {
                                 rx = Some(events.subscribe());
                                 // Catch the mirror up before live events flow.
-                                let (state, logging, trigger) = {
+                                let (state, logging, trigger, input_method) = {
                                     let snapshot = latest.lock().unwrap();
-                                    (snapshot.state.clone(), snapshot.logging, snapshot.trigger)
+                                    (
+                                        snapshot.state.clone(),
+                                        snapshot.logging,
+                                        snapshot.trigger,
+                                        snapshot.input_method.clone(),
+                                    )
                                 };
                                 let logging = Event::Logging { enabled: logging };
                                 let trigger = Event::Trigger { code: trigger };
+                                let input_method = Event::InputMethod { state: input_method };
                                 if write_event(&mut write, &logging).await.is_err()
                                     || write_event(&mut write, &trigger).await.is_err()
+                                    || write_event(&mut write, &input_method).await.is_err()
                                 {
                                     return;
                                 }

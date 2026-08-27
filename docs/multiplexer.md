@@ -227,7 +227,10 @@ the switcher stays entirely inert while `ibus-ui-gtk3` still holds it.
 
 ## Turn-taking (the point of all this)
 
-Router states, one per activation:
+Router states, one per activation — wrong on the scope, see phase-5 finding 1:
+the turn is process state that a deactivation *ends*, because an utterance
+outlives an activation and the commit has to fall back to the virtual keyboard
+rather than land in whatever window took focus.
 
 - **Forwarding** (default while a text field is focused): keys → ibus as
   above. Dictation idle.
@@ -254,7 +257,10 @@ preedit; it just becomes reachable because we finally own a bound IM.
   rebuilt; meanwhile keys pass through raw (English still types).
 - Config flag `multiplexer: false` (or the existing `bind_input_method`
   evolving into a three-way mode) → today's shipped Option B behavior.
-  Re-enabling IBus's own bridge is one autostart-line revert away.
+  Re-enabling IBus's own bridge is one autostart-line revert away. Shipped as
+  `input_method: Off | Multiplexer`; the third state is deliberately not
+  reachable, see phase-5 finding 4. The autostart revert is
+  `scripts/rollback.sh`, and it is one line, as promised.
 
 ## Phases
 
@@ -270,7 +276,7 @@ preedit; it just becomes reachable because we finally own a bound IM.
    Milestone: full mozc parity.
 4. **Panel duties** — trigger registration + engine cycling.
 5. **Dictation integration** — router turn-taking, config/autostart
-   migration, applet status surface.
+   migration, applet status surface. Done; see the phase-5 findings.
 
 Each phase is independently testable and abortable; through phase 3 the
 rollback is trivial because nothing outside cosmic-voice changed permanently.
@@ -296,14 +302,16 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
 
 ## Build strategy (banked 2026-08-25)
 
-Status: **phases 1 to 4 done (2026-08-27)**, `src/ibus/` and `src/im/` —
-see the findings sections below for what implementing them corrected in this
-document. All four are code-complete, unit-tested and green in the nested
-harness, and none has been run against a live seat: phase 4's switcher is
-deliberately inert on the live daemon while `ibus-ui-gtk3` is still its panel
-(phase-4 finding 8), so the cutover remains the one attended step, together
-with the visual pass on the candidate window that no screenshot client on this
-machine can automate (phase-3 finding 9). Phase 5 not started.
+Status: **phases 1 to 5 done (2026-08-27), cutover pending** — `src/ibus/`,
+`src/im/`, `src/sink.rs` and the `input_method` config mode. See the findings
+sections below for what implementing them corrected in this document. All five
+are code-complete, unit-tested and green in the nested harness, and none has
+been run against a live seat: phase 4's switcher is deliberately inert on the
+live daemon while `ibus-ui-gtk3` is still its panel (phase-4 finding 8), and
+phase 5 ships the cutover as `scripts/cutover.sh` plus a README procedure
+rather than as anything automatic. The cutover remains the one attended step,
+together with the visual pass on the candidate window that no screenshot client
+on this machine can automate (phase-3 finding 9).
 
 Implementation will be agent-driven, which changes the bottleneck: the
 mechanical bulk (proxies, codec, relay tables) is hours of wall clock, and the
@@ -839,3 +847,128 @@ the fallback — under `$COSMIC_VOICE_RENDER_DIR` (default the temp dir), which 
 how the layout was iterated on without a compositor in the loop.
 
 `frontend-test.sh` and `switcher-test.sh` still pass unchanged.
+
+## Findings from phase 5 (2026-08-27)
+
+Wiring the dictation engine into the frontend, and turning the design's
+`multiplexer: false` sketch into a shipped configuration, turned up these
+corrections.
+
+1. **"Router states, one per activation" is the wrong scope, and the right one
+   is the opposite.** An utterance outlives an activation: the user can be
+   speaking when focus moves, and the engine keeps recording either way. So the
+   turn is process state, not activation state — and a deactivation
+   *terminates* it rather than being the thing that scopes it, dropping back to
+   `Forwarding` so that the commit lands on the virtual keyboard instead of
+   into whichever window took focus. Reading it as per-activation would have
+   left the router in `Dictating` across the focus change, which is exactly the
+   state in which a partial becomes a preedit in the wrong application.
+
+2. **The im→engine "answer" cannot be a reply.** The design and the task both
+   describe the engine asking whether a text-input client is active. A
+   request/reply over a channel either blocks the engine's tokio loop — which
+   also drives audio capture — or hands it an answer that was already stale
+   when it arrived. The frontend *publishes* the fact instead (two atomics:
+   bound, and active), the engine reads it immediately before each use, and the
+   residual race is resolved on the other side by the turn-taking function,
+   which sees the current value. The two flags are separate because they fail
+   separately: a frontend backing off after a crash is not usable even though
+   the last activation it saw was real.
+
+3. **The dictation preedit must carry no `ClientCommitPreedit` mode, and that
+   is load-bearing rather than incidental.** The frontend remembers the mode an
+   engine attached to each preedit, and `Flush` commits one only when it is
+   `PREEDIT_COMMIT`. A dictation partial recorded with that mode would be
+   flushed by the *next* `Begin` — half a spoken sentence committed as if it
+   were a half-typed conversion. `None` is the correct mode for text nobody
+   asked us to hold.
+
+4. **The three-way config mode in the failure story should be two-way.** The
+   doc imagined `bind_input_method` "evolving into a three-way mode". The third
+   state — bind the slot from the injector, without the multiplexer — is the
+   thing that caused the 2026-08 incident, and there is no reason to keep it
+   reachable. `input_method` is `Off` or `Multiplexer`, and in *both* the
+   injector is constructed with `bind_im = false`, so there is no input-method
+   object on that connection at all. Enforcing it structurally rather than by
+   convention costs one argument and removes a whole class of edit that could
+   reintroduce a second binder.
+
+   The retired flag is warned about and ignored rather than mapped to
+   `Multiplexer`: an old setting must not activate an exclusive seat resource
+   on its own, and the mode should be written by the person doing the cutover.
+
+5. **"Run under a supervisor (systemd user unit)" is right about the mechanism
+   and wrong about the reason.** Inside the applet it is a thread and a restart
+   loop, and what that buys is not availability — a dead frontend costs nothing,
+   because the grab is released by its own object's destructor and key flow is
+   restored by the crash itself (phase-2 finding 13). What it buys is
+   *visibility*. An input method that is not there looks exactly like one that
+   is, right up until a preedit silently fails to appear. The supervisor's real
+   output is the line in the popup.
+
+6. **The startup safety check has to be made twice, in two places, for two
+   different reasons.** `im::run` refuses to bind while `ibus-ui-gtk3
+   --enable-wayland-im` is running; that is the enforcement and it stays. The
+   supervisor makes the same `/proc` scan *before* calling it, because a
+   refusal from inside `run` is an error string and this state is not an error
+   — it is the pre-cutover configuration, it is what every user sees the first
+   time they set the mode, and it deserves a sentence naming the fix rather
+   than a stack of `Failed` events. The applet turns it into
+   "Input method: blocked — …" and a warning icon, and re-checks every five
+   seconds so that `ibus exit; ibus start` is noticed without an applet
+   restart.
+
+7. **A commit that arrives outside `Dictating` is honoured, not dropped.** The
+   engine decides its path by reading the published flag, so a `Begin` that
+   found no field leaves the router in `Forwarding` while the engine may
+   nonetheless find a field by the time the transcript is ready. Dropping the
+   commit to keep the state machine tidy would throw away the user's sentence;
+   committing it puts the sentence in the field they are looking at. The
+   partial in the same situation *is* dropped, because a preedit would
+   overwrite one mozc believes it owns and there is nothing to lose by waiting
+   for the commit.
+
+8. **Phase-2 finding 10's flush is worth what it claimed, and this is the first
+   evidence of it.** `ClientCommitPreedit` was set in phase 1 and the flush was
+   written in phase 2, guarded on still being active, with the note that "the
+   `Reset` path is the one phase 5 actually needs". It is: the harness leaves
+   mozc holding an uncommitted こんにちは, sends a `Begin`, and the text lands in
+   the field instead of disappearing — which is a data-loss bug in IBus's own
+   bridge that we do not have.
+
+9. Minor. `tokio::select!` builds every arm's future at once, so two arms
+   cannot both borrow `self`; the frontend's event receiver is taken out of the
+   engine into a local for the life of the loop. A calloop channel belongs to
+   the loop that polls it, so the frontend creates it and publishes the sending
+   end through a link that outlives any one frontend — which is also what makes
+   a supervisor restart invisible to the engine. And the `--dictation-fifo`
+   reader reopens on end-of-file, because each `echo … > fifo` from a script is
+   a writer that opens, writes and closes; it refuses a path that does not
+   exist rather than creating one, which would race the script about to write
+   to it.
+
+### What was verified, and how
+
+`scripts/im-harness/dictation-test.sh` is the phase-5 regression, all eight
+assertions green on 2026-08-27 against the nested compositor and the scratch
+daemon. A fifo stands in for the microphone — `devtest im-frontend
+--dictation-fifo` reads newline-delimited JSON `DictationCmd`s and feeds them
+in exactly as the engine would — so the whole turn-taking path runs with no
+audio, no recogniser and no live session: mozc is left holding an uncommitted
+conversion, `Begin` commits it and resets behind it, partials appear as preedit
+and revise in place, the transcript commits as text, and typing afterwards
+converts again and commits into the same field. The decision itself is eleven
+unit tests in `im::dictation`, in the same shape as `im::router`'s.
+
+`frontend-test.sh`, `candidate-test.sh` and `switcher-test.sh` all still pass
+unchanged.
+
+What still needs a human: the cutover, unchanged, and now scripted as far as it
+safely can be. `scripts/cutover.sh` checks the preconditions, backs up
+`~/.config/autostart/ibus-wayland.desktop`, rewrites its one `Exec` line and
+then stops and prints the rest — retiring the running bridge with `ibus exit;
+ibus start`, setting the mode, restarting the applet, and what to do if the
+keyboard dies. It deliberately stops and starts nothing: the instant the slot
+changes hands is the one worth watching. `scripts/rollback.sh` reverses it, in
+the reverse order, which matters — the multiplexer has to let go before IBus's
+bridge takes hold.

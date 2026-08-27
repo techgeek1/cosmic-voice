@@ -20,6 +20,7 @@ mod ibus;
 mod im;
 mod inject;
 mod ipc;
+mod sink;
 mod toplevel;
 mod transcript_log;
 mod vad;

@@ -47,10 +47,10 @@
 //! workaround the daemon documents at `bus/ibusimpl.c:2650-2660`.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use calloop::channel::Sender;
+use tokio::sync::mpsc;
 use xkbcommon::xkb;
 
 use super::link::Upstream;
@@ -72,11 +72,16 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Something the IM stack wants the rest of the process to know.
 ///
-/// One variant today. It exists as an enum rather than a callback because
-/// phase 5 forwards these to the applet over the existing IPC channel, and a
-/// channel wants a message type; the frontend logs every one of them at info
-/// whether or not anybody is listening, so the trace is complete even with no
-/// receiver attached.
+/// It exists as an enum rather than a callback because the applet forwards
+/// these over the existing IPC channel and a channel wants a message type; the
+/// frontend logs every one of them at info whether or not anybody is
+/// listening, so the trace is complete even with no receiver attached.
+///
+/// Two producers: this module, which knows which engine is in effect, and
+/// [`super::supervisor`], which knows whether a frontend is running at all.
+/// One consumer — the dictation engine — folds both into the single
+/// [`crate::ipc::InputMethodState`] the panel popup renders, which is why they
+/// share one channel rather than having one each.
 #[derive(Debug, Clone)]
 pub enum ImEvent {
     /// The global input engine changed. Emitted on our own switches and on
@@ -89,6 +94,22 @@ pub enum ImEvent {
         symbol  : String,
         /// Human-readable name, e.g. `Mozc`.
         longname: String,
+    },
+    /// The frontend bound the seat's input-method slot and is running.
+    Bound,
+    /// The frontend will not bind, and the user has to do something about it.
+    /// The only cause today is IBus's own Wayland bridge still holding the
+    /// slot, which is what the cutover retires.
+    Blocked {
+        /// What to put in front of the user, in one line.
+        reason: String,
+    },
+    /// The frontend stopped. The supervisor restarts it after a backoff; this
+    /// exists so the popup says so rather than silently showing a working
+    /// input method that is not there.
+    Stopped {
+        /// Why it stopped, or "the loop exited" for a clean return.
+        reason: String,
     },
 }
 
@@ -105,6 +126,9 @@ impl std::fmt::Display for ImEvent {
                 }
                 Ok(())
             }
+            ImEvent::Bound              => write!(f, "input method bound"),
+            ImEvent::Blocked { reason } => write!(f, "input method blocked: {reason}"),
+            ImEvent::Stopped { reason } => write!(f, "input method stopped: {reason}"),
         }
     }
 }
@@ -371,7 +395,7 @@ pub struct Switcher {
     /// Engine ids from the config file. Empty means "read dconf".
     config_engines  : Vec<String>,
     /// Where to publish engine changes, if anybody asked.
-    events          : Option<mpsc::Sender<ImEvent>>,
+    events          : Option<mpsc::UnboundedSender<ImEvent>>,
     /// Whether this process is the daemon's panel. False when `ibus-ui-gtk3`
     /// already is, in which case nothing here runs at all — see
     /// [`Switcher::ensure`].
@@ -400,7 +424,7 @@ impl Switcher {
         address : Option<String>,
         triggers: Vec<String>,
         engines : Vec<String>,
-        events  : Option<mpsc::Sender<ImEvent>>,
+        events  : Option<mpsc::UnboundedSender<ImEvent>>,
         enabled : bool,
     ) -> Self {
         Self {

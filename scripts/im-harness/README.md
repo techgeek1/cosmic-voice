@@ -1,10 +1,10 @@
 # Input-method test harness
 
-Everything needed to exercise the phase-2 Wayland frontend (the
+Everything needed to exercise the Wayland frontend (the
 `zwp_input_method_v2` binder) without touching the live session: a nested
 cosmic-comp, fully automated key injection into it over libei, a
-text-input-v3 client to observe commits and preedit, and an isolated
-ibus-daemon + mozc.
+text-input-v3 client to observe commits and preedit, an isolated
+ibus-daemon + mozc, and a fifo standing in for the microphone.
 
 Verified working on 2026-08-26 against cosmic-comp 1.6.0 (`314fc670`),
 libei 1.6.0, gtk3 3.24.52, ibus 1.5.34, mozc 3.34.
@@ -115,6 +115,33 @@ forward and backward land on the same engine, so the *direction* is a unit test
 (`im::switcher::tests::cycles_both_ways`) and what this asserts is that the
 backward registration exists and that the flag — which travels in the
 `a(uuu)` keycode slot — survives the round trip.
+
+    scripts/im-harness/dictation-test.sh
+
+The phase-5 turn-taking, end to end. Same scaffolding as `frontend-test.sh`,
+plus a fifo passed with `devtest im-frontend --dictation-fifo`: the frontend
+reads newline-delimited JSON `DictationCmd`s off it and feeds them in exactly
+as the dictation engine would, so the whole path runs with no audio, no
+recogniser and no engine process. `dictate '"Begin"'` and
+`dictate '{"Partial":"hello wor"}'` are the whole interface; each write is its
+own open/write/close, which is what the reader's reopen loop is for.
+
+    PASS: mozc has an uncommitted preedit
+    PASS: and nothing is committed yet
+    PASS: Begin committed the pending conversion
+    PASS: the first partial is shown as preedit
+    PASS: the partial revised in place
+    PASS: the transcript was committed
+    PASS: typing resumed through mozc
+    PASS: and commits into the same field
+
+The first two assertions are the setup for the third and the point of the
+whole exercise: mozc is left holding a conversion the user has not committed,
+and `Begin` has to finish it into the field rather than throw it away. The
+decision itself is a unit test (`im::dictation::tests`); what only a real
+daemon can prove is that the preedit really was held under
+`ClientCommitPreedit` with mode=commit, and that resetting the context behind
+the flush leaves mozc able to convert again — which is the last two.
 
     scripts/im-harness/smoke-test.sh ["text to type"]
 
@@ -261,9 +288,12 @@ These need a human at the keyboard and are deliberately not scripted:
   and `cargo test` writes PNGs of fixture candidate lists under
   `$COSMIC_VOICE_RENDER_DIR`, but nothing captures what the compositor actually
   put on screen; see "Known gaps".
-* **Anything binding the live seat's IM slot** - the phase-2 cutover, the
-  visual pass, final acceptance. Keep a recovery shell open. `pkill
-  cosmic-voice` must restore key flow; if it does not, kill ibus.
+* **Anything binding the live seat's IM slot** - the cutover, the visual pass,
+  final acceptance. Keep a recovery shell open. `pkill cosmic-voice` must
+  restore key flow; if it does not, kill ibus. The cutover itself is
+  `scripts/cutover.sh`, which changes one autostart line and then prints the
+  steps for the running session; `scripts/rollback.sh` reverses it. Neither may
+  be run from a test.
 Engine-switch hotkeys are no longer on this list. `switcher-test.sh` covers
 them against the scratch daemon, and the frontend refuses to register anything
 on a daemon whose panel is still `ibus-ui-gtk3` unless an explicit ibus address
