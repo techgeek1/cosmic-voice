@@ -966,6 +966,30 @@ corrections.
     options it did not recognise (`main.vala:806`), so the extra layer buys
     nothing but a dependency on that behaviour staying put.
 
+11. **A daemon with no panel has no global engine, and the switcher has to
+    choose one.** Second thing the first live attempt showed: the slot bound,
+    the popup read "bound, waiting for IBus", `ibus engine` said `No engine is
+    set`, and every key fell through unhandled. Choosing the startup engine was
+    ibus-ui-gtk3's job — `update_engines` ends in `switch_engine(0, true)`,
+    i.e. `SetGlobalEngine` on the head of `engines-order`
+    (`ui/gtk3/panel.vala:1445`) — and nothing in the daemon does it for a
+    panel-less start. With `use-global-engine` on, no global engine means no
+    engine at all, which is silent: the daemon is up, contexts are created,
+    `ProcessKeyEvent` simply answers false. The switcher now does what the
+    panel did, on connect, only when the daemon reports none (an engine the
+    cycle does not list is left alone: it got there by the user's hand and
+    `next_engine` already handles an outsider). `switcher-test.sh` no longer
+    sets the scratch daemon's engine by hand, so its first assertion is now
+    this one.
+
+    Lost with the same process, and not yet replaced: the tray indicator
+    (ibus-ui-gtk3's StatusNotifierItem, with the engine icon, mozc's input-mode
+    icon via the engine's `icon_prop_key`, and a menu for both). The mode icon
+    and the property menu are only reachable by *being* the daemon's panel
+    service (`org.freedesktop.IBus.Panel`: `RegisterProperties`,
+    `UpdateProperty`, `PropertyActivate`), which the phase-4 panel connection
+    deliberately is not. Open decision, see the end of this document.
+
 ### What was verified, and how
 
 `scripts/im-harness/dictation-test.sh` is the phase-5 regression, all eight

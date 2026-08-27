@@ -22,6 +22,9 @@
 # What it proves, in order:
 #
 #   1. registration    the (ya(uuu)) property Set is accepted by the daemon
+#   1b. startup engine  the scratch daemon starts with NO global engine, as a
+#                      live `ibus-daemon --panel disable` does, and the frontend
+#                      chooses the head of the cycle the way ibus-ui-gtk3 did
 #   2. forward cycle   Ctrl+Alt+Space moves xkb:us::eng -> mozc-on
 #   3. it cycles       and again, back to xkb:us::eng
 #   4. backward flag   Shift+Ctrl+Alt+Space reports is_backward, which is the
@@ -112,7 +115,9 @@ await_engine() {
 "$here/nested-comp.sh" env >/dev/null 2>&1 || "$here/nested-comp.sh" start >/dev/null
 harness_require_env_file
 "$here/scratch-ibus.sh" start >/dev/null 2>&1
-"$here/scratch-ibus.sh" engine "xkb:us::eng" >/dev/null 2>&1
+# Deliberately no `scratch-ibus.sh engine` here: a fresh daemon with no panel
+# has no global engine (phase-5 finding 11), and choosing one is now the
+# frontend's job. Assertion 1b below is that it did.
 ibus_address="$(sed -n 's/^IBUS_ADDRESS=//p' "$IM_HARNESS_STATE/ibus/ibus.env")"
 [ -n "$ibus_address" ] || { echo "no scratch ibus address"; exit 2; }
 
@@ -157,7 +162,15 @@ grep -q 'activate ' "$WORK/frontend.log" || {
     echo "FAIL: the frontend was never activated; is another input method bound?"
     exit 1
 }
-check "the cycle starts on xkb:us::eng" "xkb:us::eng" "$(global_engine)"
+# 1b. The daemon had no engine and the frontend gave it the head of the cycle.
+#     Checked through the daemon, not the log: what matters is what a context
+#     gets, and the log line only says we asked.
+check "the frontend chose xkb:us::eng for an engine-less daemon" "xkb:us::eng" "$(await_engine "xkb:us::eng")"
+if ! frontend_log | grep -q 'ibus had no global engine; chose xkb:us::eng'; then
+    echo "FAIL: the frontend did not report choosing an engine"
+    frontend_log | grep -i engine
+    fails=$((fails + 1))
+fi
 
 # 2. Forward. The daemon consumes the trigger inside ProcessKeyEvent and
 #    answers handled, so no space is typed either — which the entry's contents

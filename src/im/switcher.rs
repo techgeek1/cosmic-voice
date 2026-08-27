@@ -540,7 +540,39 @@ impl Switcher {
         }
         self.panel = Some(panel);
 
+        self.choose_engine_if_none();
+
         Ok(())
+    }
+
+    /// Gives a daemon that has no global engine the head of the cycle.
+    ///
+    /// Choosing the engine at startup was ibus-ui-gtk3's job — `update_engines`
+    /// ends in `switch_engine(0, true)` (`ui/gtk3/panel.vala:1445`) — and a
+    /// daemon started with `--panel disable` has nobody else to do it. Until
+    /// somebody does, `use-global-engine` means *no* engine: every key comes
+    /// back unhandled, mozc never starts, and the popup reads "waiting for
+    /// IBus" indefinitely (phase-5 finding 11).
+    ///
+    /// Only the empty case. ibus-ui-gtk3 also jumps to the head of its cycle
+    /// when the daemon's engine is one it does not list; we keep that engine,
+    /// because it got there by the user's hand through some other route, and
+    /// [`next_engine`] already treats an outsider as "before the first".
+    ///
+    /// `current` is left for `GlobalEngineChanged` to fill in, as after any
+    /// other switch: the confirmation is the source of truth, and the signal
+    /// thread is already running to receive it.
+    fn choose_engine_if_none(&self) {
+        if self.current.is_some() {
+            return;
+        }
+        let (Some(first), Some(panel)) = (self.engines.first(), self.panel.as_ref()) else {
+            return;
+        };
+        match panel.set_global_engine(first) {
+            Ok(())  => tracing::info!("ibus had no global engine; chose {first}"),
+            Err(e)  => tracing::warn!("ibus has no global engine, and choosing {first} failed: {e}"),
+        }
     }
 
     /// Fills the description cache and reports engines the registry lacks.
