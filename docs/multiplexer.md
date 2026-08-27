@@ -216,6 +216,15 @@ cycles, the panel applet can display the current engine name. (The daemon's
 own release-signal latency workaround suggests keeping any future
 press/release switcher state client-side.)
 
+Four corrections from building it, all detailed in the phase-4 findings: the
+response signal is a **broadcast filtered by `AddMatch`**, so subscribing is
+not optional and two subscribers both act; the `keycode` field of a
+registration is the **backward flag**, not a keycode; the modifiers must be
+spelled in the bits that survive `IBUS_MODIFIER_FILTER`, which means `MOD4`
+rather than `SUPER`; and because the response is broadcast and the property is
+last-writer-wins with no unregister, the panel role is exclusive in practice —
+the switcher stays entirely inert while `ibus-ui-gtk3` still holds it.
+
 ## Turn-taking (the point of all this)
 
 Router states, one per activation:
@@ -285,10 +294,13 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
 
 ## Build strategy (banked 2026-08-25)
 
-Status: **phases 1 and 2 done (2026-08-26)**, `src/ibus/` and `src/im/` — see
-the findings sections below for what implementing them corrected in this
-document. Phase 2 is code-complete and unit-tested but has not yet been run
-against a live seat; phases 3–5 not started.
+Status: **phases 1, 2 and 4 done (2026-08-27)**, `src/ibus/` and `src/im/` —
+see the findings sections below for what implementing them corrected in this
+document. All three are code-complete, unit-tested and green in the nested
+harness, and none has been run against a live seat: phase 4's switcher is
+deliberately inert on the live daemon while `ibus-ui-gtk3` is still its panel
+(phase-4 finding 8), so the cutover remains the one attended step. Phases 3
+and 5 not started.
 
 Implementation will be agent-driven, which changes the bottleneck: the
 mechanical bulk (proxies, codec, relay tables) is hours of wall clock, and the
@@ -534,3 +546,135 @@ What still needs a human: anything on the live seat (the cutover itself), and
 the visual pass — the nested compositor renders on the live desktop but there
 is no scripted screenshot, so preedit styling and, from phase 3, the candidate
 window are looked at rather than asserted.
+
+## Findings from phase 4 (2026-08-27)
+
+Registering the engine-switch trigger and cycling engines against ibus 1.5.34.
+Citations are into the 1.5.34 tree unless stated.
+
+1. **`GlobalShortcutKeyResponded` is a broadcast filtered by match rule, and
+   nothing else.** The design and the phase-1 proxy left "who receives it" open.
+   The answer: `bus_ibus_impl_emit_signal` builds a signal with **no
+   destination** and hands it to `bus_dbus_impl_dispatch_message_by_rule`
+   (`bus/ibusimpl.c:2477-2492`), whose recipient list is built by walking
+   `dbus->rules` and asking each for its matching connections
+   (`bus/dbusimpl.c:1996-2019`). The rules are the ones clients registered with
+   `AddMatch` (`bus/dbusimpl.c:960-999`). So it goes to **every connection
+   holding a matching match rule** — not to the client that called
+   `SetGlobalShortcutKeys`, not to the focused input context's connection, and
+   not to anybody who merely declared the signal in a proxy. A client that does
+   not `AddMatch` sees nothing; two clients that do both see it and both act.
+   That last part is why phase 4 refuses to run at all when `ibus-ui-gtk3` is
+   the daemon's panel (below), rather than merely declining to register.
+   ibus-daemon rewrites `sender='org.freedesktop.IBus'` in a rule to its own
+   unique name as a special case (`bus/dbusimpl.c:976-978`), so the obvious
+   rule text works.
+2. **The `keycode` field of a registration is the backward flag, not a
+   keycode.** `is_backward = ibus->ime_switcher_keys[i].keycode != 0`
+   (`bus/ibusimpl.c:2622`); `ibus-ui-gtk3` writes `kb.reverse ? 1 : 0` into it
+   (`ui/gtk3/panel.vala:549`). Nothing ever compares it against a hardware
+   keycode. Putting a real evdev+8 there — the natural reading of `a(uuu)` —
+   would silently register every trigger as backward. The same field in the
+   *outgoing* `GlobalShortcutKeyResponded` is a genuine keycode: the harness log
+   shows `keycode=65` for space, `keycode=37` for Control_L. The wire type is
+   symmetric and the meaning is not.
+3. **The enum is `IBusBusGlobalBindingType` and it lives in `ibusbus.h:79-84`**
+   — `ANY` 0, `IME_SWITCHER` 1, `EMOJI_TYPING` 2 — not in `ibustypes.h` and not
+   under a `…GLOBAL_SHORTCUT_KEYS…` name. Only `IME_SWITCHER` is storable:
+   the setter's `switch` has one case and a `default` that frees the keys it was
+   handed (`bus/ibusimpl.c:2039-2050`), so registering the emoji type in 1.5.34
+   stores nothing and fires nothing.
+4. **A registration must be spelled in modifiers the daemon can still see when
+   it compares.** Before matching, the daemon rewrites `SUPER` to `MOD4` and
+   then masks with `IBUS_MODIFIER_FILTER` (`bus/ibusimpl.c:2615-2619`), and that
+   filter *excludes* `SUPER`, `HYPER` and `META` (`ibustypes.h:386-398`). A
+   trigger registered with `IBUS_SUPER_MASK` can therefore never match anything.
+   `<Super>space` — the schema default — has to be registered as `MOD4`. GTK's
+   panel gets there by a different road, `gdk_keymap_map_virtual_modifiers`
+   (`ui/gtk3/bindingcommon.vala:73-84`); we map `<Super>`/`<Hyper>` to MOD4 and
+   `<Meta>` to MOD1 directly, which is where a standard X keymap puts them.
+5. **The trigger is consumed before focus, before the engine, and before the
+   post-process queue.** `_ic_process_key_event` calls
+   `bus_ibus_impl_process_key_event` first and, on a hit, returns `(b) TRUE` and
+   clears `processing_key_event` (`bus/inputcontext.c:1085-1099`). So the sync
+   drain is empty for a trigger press, the routing rules see `handled=true` and
+   swallow it, and no space is typed. It also means *any* context can trigger a
+   switch, focused or not.
+6. **Every use of a modified trigger fires the signal twice, and the second one
+   swallows a key release.** Press gives a hit with the press state; releasing
+   the trigger key while the modifiers are held gives no hit; releasing the last
+   modifier gives a *second* hit with `RELEASE_MASK` set
+   (`bus/ibusimpl.c:2626-2647`, driven by a file-static `binding_state`). That
+   is the panel's switcher-popup protocol — press moves the selection, release
+   commits it. Cycle-only v1 acts on the press and ignores the release. The
+   side effect is worth knowing: because the release edge also answers
+   `handled=true`, the frontend swallows that key release and the application
+   never sees it. Measured in the harness, `Control_L release` after
+   Ctrl+Alt+Space is swallowed. Harmless as things stand — the grab's
+   `modifiers` events are forwarded to the virtual keyboard independently, so
+   the compositor-level modifier state stays correct — but an application that
+   tracks modifiers from key events alone would see one stuck.
+7. **Correction to phase-1 finding 9.** "The engine attaches to a context only
+   on `FocusIn`" is true of the *first* attach and false of a switch:
+   `bus_ibus_impl_set_global_engine_by_name` changes the engine on the focused
+   context directly (`bus/ibusimpl.c:1007-1038`), so a `SetGlobalEngine` while
+   our context is focused takes effect immediately with no refocus. The harness
+   proves it — mozc converts `konnnitiha` right after a switch into `mozc-on`.
+8. **The panel role is exclusive in practice even though nothing enforces it.**
+   `GlobalShortcutKeys` is last-writer-wins with no unregister, and (finding 1)
+   the response is broadcast. So with `ibus-ui-gtk3` running as the session's
+   panel, registering would replace its trigger while it is still acting on the
+   response, and *both* processes would cycle the engine on every press. The
+   nested-display argument does not help here: a display has seats, a daemon
+   does not. `im::run` therefore leaves the switcher entirely inert when
+   `ibus-ui-gtk3 --enable-wayland-im` is running and no explicit ibus address
+   was given, and says so in the log. This is the phase-4 analogue of the
+   input-method binding check, and it is the reason phase 4 could be developed
+   and tested without an attended session.
+9. **Engine cycling reads dconf by shelling out to `gsettings`.** Nothing in the
+   dependency graph pulls glib in, and adding `gio` to read three string lists
+   at startup would be the largest dependency in the tree by build time. The
+   engine list reproduces the panel's own construction: `engines-order`
+   intersected with `preload-engines`, then whatever the order does not mention
+   (`ui/gtk3/panel.vala:1390-1408`). The panel then keeps that list in MRU order
+   with the current engine at index 0 and switches to index 1 or `len - 1`
+   (`ui/gtk3/panel.vala:1345-1352`); we do not, because MRU is what makes its
+   switcher popup useful and, with no popup, only makes the cycle
+   unpredictable. `config.ron`'s `ibus_triggers` and `ibus_engines` override
+   both lists, which is what gives the harness known fixtures — the scratch
+   daemon runs `--config disable` with an `XDG_CONFIG_HOME` of its own, so its
+   dconf is empty and its `preload-engines` with it.
+10. **The switch is confirmed, not assumed.** `SetGlobalEngine` returning
+    success does not mean the engine changed — the daemon can refuse, and the
+    engine can change from elsewhere. `current` is only ever updated from
+    `GlobalEngineChanged`, which the daemon emits either way, so the cycle
+    cannot drift from what is really in effect. Measured latency in the
+    harness: 210ms for the first switch into `mozc-on` (engine process
+    startup), ~1ms after that.
+11. Minor: registering makes `bus_ibus_impl_is_wayland_session` true
+    (`bus/ibusimpl.c:2666-2672`), which arms the `ignore_focus_out` trap of
+    phase-1 finding 1 — our client name already opts out, and this is now the
+    code path that arms it rather than a future one. Holding the trigger down
+    repeats it, because `xkb_keymap_key_repeats` is true for space and the
+    frontend's repeat timer does not know the key was a shortcut; a tap is well
+    inside the 600ms delay, so it only bites someone who holds the combination.
+    Registering an empty list is refused by the daemon
+    (`g_return_val_if_fail (size > 0, FALSE)`, `bus/ibusimpl.c:2025`), so
+    nothing is sent when no accelerator parsed.
+
+### What was verified, and how
+
+`scripts/im-harness/switcher-test.sh`, all seven assertions green on
+2026-08-27 against the scratch daemon: the `(ya(uuu))` `Set` is accepted;
+Ctrl+Alt+Space moves `xkb:us::eng` → `mozc-on` and back; the Shift-modified
+trigger arrives with `is_backward` set, which is the keycode-slot encoding
+making a full round trip; and mozc converts `konnnitiha` afterwards, which it
+could not do if the engine had not really changed. `frontend-test.sh` still
+passes unchanged, and in that run the panel takes its trigger from the *live*
+dconf (read-only) rather than from a config file, which is the other half of
+the path.
+
+What still needs a human: the live cutover, unchanged. Phase 4 adds nothing to
+that list — the guard in finding 8 means the switcher is inert on the live
+daemon until `ibus-ui-gtk3 --enable-wayland-im` is retired, which is the same
+moment the input-method binding becomes ours.

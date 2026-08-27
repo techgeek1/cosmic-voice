@@ -69,6 +69,33 @@ directory's own command lines contain every pattern you would want to match,
 and the user's panel applet is also called `cosmic-voice`. Kill by recorded
 pid, as the scripts do.
 
+    scripts/im-harness/switcher-test.sh
+
+The phase-4 panel duties, end to end. Same scaffolding as `frontend-test.sh`,
+plus a config file passed with `devtest im-frontend --config` that pins
+`ibus_triggers` to `["<Control><Alt>space"]` and `ibus_engines` to
+`["xkb:us::eng", "mozc-on"]` — neither the scratch daemon's dconf (empty, it
+runs `--config disable`) nor the frontend's inherited dconf (the user's real
+settings) is a fixture, so the override is what makes exact assertions
+possible. Injects the trigger over libei and asserts on the daemon's global
+engine:
+
+    PASS: trigger registered: control|mod1+space, shift|control|mod1+space
+    PASS: the cycle starts on xkb:us::eng
+    PASS: Ctrl+Alt+Space switched to mozc-on
+    PASS: pressing it again switched back
+    PASS: Shift+Ctrl+Alt+Space reported the backward binding
+    PASS: the backward trigger also switched the engine
+    PASS: mozc converted after the switch
+
+Ctrl+Alt+Space rather than the schema default `<Super>space` because
+cosmic-comp filters its own compositor shortcuts before the input-method grab
+sees them, and Super combinations are where those live. With a two-entry cycle
+forward and backward land on the same engine, so the *direction* is a unit test
+(`im::switcher::tests::cycles_both_ways`) and what this asserts is that the
+backward registration exists and that the flag — which travels in the
+`a(uuu)` keycode slot — survives the round trip.
+
     scripts/im-harness/smoke-test.sh ["text to type"]
 
 The harness checking itself, without the frontend in the loop:
@@ -204,9 +231,14 @@ These need a human at the keyboard and are deliberately not scripted:
 * **Anything binding the live seat's IM slot** - the phase-2 cutover, the
   visual pass, final acceptance. Keep a recovery shell open. `pkill
   cosmic-voice` must restore key flow; if it does not, kill ibus.
-* **Engine-switch hotkeys** (phase 4): registering global shortcut keys with
-  the daemon arms ibus's `ignore_focus_out` trap, so test it against the
-  scratch daemon first.
+Engine-switch hotkeys are no longer on this list. `switcher-test.sh` covers
+them against the scratch daemon, and the frontend refuses to register anything
+on a daemon whose panel is still `ibus-ui-gtk3` unless an explicit ibus address
+is given — the registration is a last-writer-wins global with no unregister,
+and the daemon broadcasts the response to every subscriber, so two panels
+would both act on one press. Registering also arms ibus's `ignore_focus_out`
+trap (`docs/multiplexer.md`, phase-1 finding 1); our client name opts out of
+it, but nothing else on the live daemon would.
 
 ## Known gaps
 

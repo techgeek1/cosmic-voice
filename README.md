@@ -53,8 +53,8 @@ machine.
 `docs/multiplexer.md` designs the next version: one process owns the seat's
 `zwp_input_method_v2` slot and multiplexes it between dictation and IBus, so
 typed CJK and spoken text stop competing for a compositor slot that has no
-sharing semantics. Phases one and two are in the tree; nothing shipped uses
-them yet, and the applet's behaviour is unchanged.
+sharing semantics. Phases one, two and four are in the tree; nothing shipped
+uses them yet, and the applet's behaviour is unchanged.
 
 `src/ibus` is the upstream leg: a hand-written D-Bus client for ibus-daemon's
 own private bus, with address discovery, the `IBusSerializable` codec for
@@ -72,14 +72,30 @@ IBus's asynchronous signals, and a timer that does key repeat and
 reconnection. Candidates are received but not yet drawn, so mozc conversion
 works blind — that is phase three.
 
+`im/switcher.rs` and `ibus/panel.rs` are the panel duties the retired
+`ibus-ui-gtk3` leaves behind: without something registering the engine-switch
+trigger with ibus-daemon, Super+Space just types a space. The accelerators come
+from dconf (`org.freedesktop.ibus.general.hotkey triggers`) or from the config,
+are registered as the daemon's global shortcut keys with their Shift-modified
+backward twins, and a fired trigger cycles the engine over `preload-engines`.
+It stays entirely inert while `ibus-ui-gtk3` is still the daemon's panel: the
+registration is a last-writer-wins global with no unregister, and the daemon
+broadcasts the response to every subscriber, so two panels would fight over
+one hotkey.
+
 The routing rules are a pure function in `im/router.rs` with unit tests, which
-is the part that can be checked without a compositor. The rest is checked by
+is the part that can be checked without a compositor; accelerator parsing and
+the cycle arithmetic in `im/switcher.rs` are the same. The rest is checked by
 `scripts/im-harness/frontend-test.sh`, which starts a nested cosmic-comp, an
 isolated ibus-daemon with mozc, a GTK entry and the frontend, injects keys over
 libei, and asserts that `konnnitiha` comes out of the entry as こんにちは, that
 plain keys arrive as committed text, that Ctrl-A still reaches the application
 as a key, that a held key repeats at the right rate, and that killing
-ibus-daemon leaves typing working. None of it touches the live session.
+ibus-daemon leaves typing working. `scripts/im-harness/switcher-test.sh` does
+the same for the panel duties: it injects Ctrl+Alt+Space and asserts that the
+engine toggles both ways, that the Shift-modified trigger comes back flagged
+backward, and that mozc converts afterwards. None of it touches the live
+session.
 
 Three hidden devtests exercise the two legs. `cosmic-voice devtest ibus-info`
 is read-only — it connects, decodes the engine registry and reports what the
@@ -92,7 +108,9 @@ frontend itself, and **refuses to run on the display it inherited**: binding
 a second input method on a seat that already has one does not fail cleanly on
 cosmic-comp, it wedges the keyboard session-wide, so the display is named
 explicitly and the live one has to be asked for with `--live-i-know`. Point it
-at a nested compositor.
+at a nested compositor. `--config <path>` gives it a config file other than the
+user's, which is how the harness pins the engine-switch trigger and the engine
+cycle to known values.
 
 ## Setup
 
@@ -110,6 +128,17 @@ model stops getting faster. `segment_pause_ms` (500) is the trailing silence
 that ends a segment inside a long utterance and `min_segment_ms` (3000) the
 speech a segment must carry before a pause may end it — set `segment_pause_ms`
 to 0 to disable segmentation and decode every utterance in one pass.
+
+Two more belong to the input-method multiplexer and are empty by default, which
+means "use the desktop's own settings". `ibus_triggers` is the engine-switch
+accelerators in GTK syntax (`["<Control><Alt>space"]`); empty reads dconf
+`org.freedesktop.ibus.general.hotkey triggers`, the key IBus's own settings
+edit. `ibus_engines` is the engine ids the trigger cycles through
+(`["xkb:us::eng", "mozc-jp"]`); empty reads dconf `preload-engines` in the order
+`engines-order` remembers. Setting either overrides what the rest of the desktop
+believes, and whatever ends up in `ibus_triggers` is registered with ibus-daemon
+as a global shortcut that only a daemon restart clears — so they exist for
+testing a known value, not as the normal way to configure this.
 
 `cosmic-voice enable|disable|start|stop|toggle|cancel` controls a running
 instance from scripts or extra keybindings.
@@ -145,3 +174,4 @@ rest mirror it, so every panel icon works and nothing runs multiplied.
 | `app.rs`       | panel applet, icon and settings popup             |
 | `ibus/`        | D-Bus client for ibus-daemon, the multiplexer's upstream leg |
 | `im/`          | Wayland input-method frontend, the multiplexer's downstream leg |
+| `im/switcher.rs` + `ibus/panel.rs` | the IBus panel duties: engine-switch trigger and engine cycle |

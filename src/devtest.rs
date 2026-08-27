@@ -43,7 +43,7 @@ pub fn run(args: &[String]) -> Result<()> {
             "checks: decode <model_dir> <wav> [threads] | stream <model_dir> <wav> [threads] | \
              finalize <model_dir> <wav> [threads] | capture <secs> | keys | rebind | \
              inject-probe | type <secs> <text> | ibus-info | ibus-keys <engine> <key>… | \
-             im-frontend <wayland-display> [ibus-address]"
+             im-frontend <wayland-display> [ibus-address] [--config <path>]"
         )),
     }
 }
@@ -519,29 +519,60 @@ fn parse_key_spec(spec: &str) -> Result<(u32, u32)> {
 ///
 /// The optional ibus address points the frontend at a scratch daemon without
 /// setting `IBUS_ADDRESS` for anything else in the process.
+///
+/// `--config <path>` reads a RON config from somewhere other than
+/// `~/.config/cosmic-voice/config.ron`, which is how the harness gives the
+/// panel duties a known trigger and a known engine cycle instead of whatever
+/// the user's dconf says. Without it the user's own config is used, so
+/// `ibus_triggers` and `ibus_engines` mean the same thing here as they will in
+/// the shipped applet.
 fn im_frontend(args: &[String]) -> Result<()> {
     let mut display = None;
     let mut address = None;
+    let mut config_path = None;
     let mut allow_live = false;
-    for argument in args {
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--live-i-know"           => allow_live = true,
-            _ if display.is_none()    => display = Some(argument.clone()),
-            _ if address.is_none()    => address = Some(argument.clone()),
-            other                     => return Err(anyhow!("unexpected argument {other:?}")),
+            "--live-i-know"        => allow_live = true,
+            "--config"             => {
+                config_path = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--config needs a path"))?
+                        .clone(),
+                );
+            }
+            _ if display.is_none() => display = Some(argument.clone()),
+            _ if address.is_none() => address = Some(argument.clone()),
+            other                  => return Err(anyhow!("unexpected argument {other:?}")),
         }
     }
 
     let Some(display) = display else {
         return Err(anyhow!(
-            "usage: cosmic-voice devtest im-frontend <wayland-display> [ibus-address]"
+            "usage: cosmic-voice devtest im-frontend <wayland-display> [ibus-address] \
+             [--config <path>]"
         ));
+    };
+
+    let config = match config_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {path}"))?;
+            ron::from_str::<crate::config::Config>(&text)
+                .with_context(|| format!("parsing {path}"))?
+        }
+        None => crate::config::Config::load(),
     };
 
     crate::im::run(crate::im::Options {
         display     : display,
         ibus_address: address,
         allow_live  : allow_live,
+        triggers    : config.ibus_triggers,
+        engines     : config.ibus_engines,
+        events      : None,
     })
 }
 

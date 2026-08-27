@@ -23,15 +23,17 @@
 //!   part of the leg that can be checked without a compositor.
 //! - [`link`] — when to build an IBus context, and how its asynchronous signals
 //!   reach the loop.
+//! - [`switcher`] — the panel duties: parsing the engine-switch accelerators,
+//!   registering them with the daemon, and cycling engines when one fires.
 //! - [`content_type`] — text-input-v3's idea of what a field is, translated to
 //!   IBus's.
 //!
 //! # Not here yet
 //!
-//! Candidate rendering (phase 3), the panel duties that make Super+Space switch
-//! engines (phase 4), and dictation turn-taking (phase 5). With this phase
-//! alone, typing through mozc works but the candidate window is invisible, so
-//! it is a milestone rather than something to switch to as a daily driver.
+//! Candidate rendering (phase 3) and dictation turn-taking (phase 5). With
+//! phase 2 alone, typing through mozc works but the candidate window is
+//! invisible, so it is a milestone rather than something to switch to as a
+//! daily driver.
 //!
 //! # Safety
 //!
@@ -50,5 +52,7 @@ mod frontend;
 mod keyboard;
 mod link;
 mod router;
+mod switcher;
 
 pub use frontend::{Options, run};
+pub use switcher::ImEvent;

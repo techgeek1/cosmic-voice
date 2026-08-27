@@ -113,6 +113,27 @@ pub struct Config {
     /// The applet toggles this at runtime without writing it back here; the
     /// config value is only the state at startup.
     pub log_transcripts     : bool,
+    /// Engine-switch accelerators for the input-method multiplexer, in GTK
+    /// syntax (`"<Control><Alt>space"`, `"<Super>space"`).
+    ///
+    /// Empty — the default — means read the user's own setting from dconf,
+    /// `org.freedesktop.ibus.general.hotkey triggers`, which is what
+    /// `ibus-ui-gtk3` reads and therefore what the desktop's input-method
+    /// settings actually edit. Set it only to test a known value or to differ
+    /// from IBus deliberately: whatever is here is registered with ibus-daemon
+    /// as the global switch trigger, and the daemon has no unregister.
+    ///
+    /// Each entry also registers its Shift-modified twin as the backward
+    /// cycle, unless it already contains Shift.
+    pub ibus_triggers       : Vec<String>,
+    /// The engine ids the switch trigger cycles through, e.g.
+    /// `["xkb:us::eng", "mozc-jp"]`.
+    ///
+    /// Empty — the default — means read dconf `preload-engines` in the order
+    /// `engines-order` remembers, which is the list the desktop's input-method
+    /// settings maintain. The daemon's own `ActiveEngines` is not usable for
+    /// this: it is empty unless a component has been loaded.
+    pub ibus_engines        : Vec<String>,
 }
 
 // --- Config ---
@@ -140,6 +161,8 @@ impl Default for Config {
             stability_frames    : 2,
             asr_nice            : -5,
             log_transcripts     : false,
+            ibus_triggers       : Vec::new(),
+            ibus_engines        : Vec::new(),
         }
     }
 }
