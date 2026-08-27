@@ -13,13 +13,18 @@
 # What it changes:
 #
 #   ~/.config/autostart/ibus-wayland.desktop
-#     Exec=ibus start --type wayland   ->   Exec=ibus start
+#     Exec=ibus start --type wayland   ->   Exec=ibus-daemon --xim --panel disable
 #
-# That is the whole persistent part of the cutover. `--type wayland` is what
-# makes ibus-daemon launch `ibus-ui-gtk3 --enable-wayland-im`, which is the
-# process holding the slot; without it ibus-daemon, mozc and the XIM server for
-# XWayland clients all still run, and cosmic-voice takes over the Wayland
-# input-method role and the panel duties that came with it.
+# That is the whole persistent part of the cutover. `ibus start --type wayland`
+# launches `ibus-ui-gtk3 --enable-wayland-im`, which is the process holding the
+# slot, and so does a bare `ibus start`: with no `--type` it probes the
+# compositor for zwp_input_method_manager_v2 and takes the Wayland route when
+# it finds one (ibus 1.5.34 tools/main.vala, start_daemon_real), so on COSMIC
+# the two are the same command. Running ibus-daemon itself, with the daemon
+# arguments the bridge would have passed it, is the only form that cannot grow
+# a bridge. ibus-daemon, mozc and the XIM server for XWayland clients all still
+# run; cosmic-voice takes over the Wayland input-method role and the panel
+# duties that came with it.
 #
 # `scripts/rollback.sh` puts it back.
 
@@ -40,9 +45,12 @@ yes=false
 [ -n "${WAYLAND_DISPLAY:-}" ] || die "no WAYLAND_DISPLAY; run this from inside your COSMIC session"
 [ -f "$AUTOSTART" ] || die "$AUTOSTART does not exist; nothing here starts IBus's Wayland bridge"
 
-if ! grep -q '^Exec=ibus start --type wayland' "$AUTOSTART"; then
-    if grep -q '^Exec=ibus start' "$AUTOSTART"; then
-        say "Already cut over: $AUTOSTART does not ask for --type wayland."
+# Both `ibus start` forms are accepted: `--type wayland` is what the package
+# installs, and a bare `ibus start` is what an earlier revision of this script
+# wrote, believing it would not launch the bridge. It does.
+if ! grep -Eq '^Exec=ibus start( --type wayland)?$' "$AUTOSTART"; then
+    if grep -q '^Exec=ibus-daemon --xim --panel disable$' "$AUTOSTART"; then
+        say "Already cut over: $AUTOSTART runs ibus-daemon directly."
     else
         die "$AUTOSTART has an Exec line I do not recognise; edit it by hand:
 $(grep '^Exec=' "$AUTOSTART")"
@@ -93,7 +101,7 @@ fi
 cp -p "$AUTOSTART" "$BACKUP"
 # In place, through a temp file, so an interrupted write cannot leave a
 # truncated autostart entry behind.
-sed 's|^Exec=ibus start --type wayland$|Exec=ibus start|' "$AUTOSTART" > "$AUTOSTART.tmp"
+sed -E 's|^Exec=ibus start( --type wayland)?$|Exec=ibus-daemon --xim --panel disable|' "$AUTOSTART" > "$AUTOSTART.tmp"
 mv "$AUTOSTART.tmp" "$AUTOSTART"
 
 say ""
@@ -119,12 +127,14 @@ keyboard stops responding at any point, the recovery is at the bottom.
      The autostart line only takes effect at the next login, so:
 
          ibus exit
-         ibus start
+         ibus-daemon --xim --panel disable --daemonize
 
      `ibus exit` stops ibus-daemon and the ibus-ui-gtk3 that holds the slot;
-     `ibus start` brings the daemon back without `--type wayland`, so nothing
-     rebinds it. Typed CJK stops working at this point — that is expected, and
-     it is what cosmic-voice is about to take over.
+     the second line brings the daemon back on its own, so nothing rebinds
+     it. Do NOT use `ibus start` for this, with or without `--type`: on a
+     Wayland session it launches the bridge again. Typed CJK stops working at
+     this point — that is expected, and it is what cosmic-voice is about to
+     take over.
 
      Check that the slot really is free:
 

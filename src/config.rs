@@ -290,9 +290,9 @@ pub enum InputMethod {
     /// This process owns the slot and multiplexes it: IBus's engines drive it
     /// while the user types, dictation drives it while the user talks.
     ///
-    /// Requires the autostart cutover — `ibus start` instead of `ibus start
-    /// --type wayland` — because two processes cannot hold the slot and the
-    /// applet refuses to try. With it set but the cutover not done, the applet
+    /// Requires the autostart cutover — `ibus-daemon --xim --panel disable`
+    /// instead of `ibus start` — because two processes cannot hold the slot
+    /// and the applet refuses to try. With it set but the cutover not done, the applet
     /// says so in its popup and keeps working on the virtual-keyboard path.
     Multiplexer,
 }

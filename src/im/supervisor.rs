@@ -60,7 +60,7 @@ const HEALTHY: Duration = Duration::from_secs(60);
 
 /// How often to re-check whether IBus's bridge has gone away.
 ///
-/// The cutover is `ibus exit; ibus start`, which the user runs by hand in a
+/// The cutover is `ibus exit; ibus-daemon …`, which the user runs by hand in a
 /// terminal, so this is how long they wait before the applet notices. Short
 /// enough not to be mistaken for "it did not work", long enough not to be
 /// scanning `/proc` in a loop.

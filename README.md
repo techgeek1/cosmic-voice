@@ -210,7 +210,8 @@ cheap.
 
 It checks the preconditions, backs `~/.config/autostart/ibus-wayland.desktop`
 up to `ibus-wayland.desktop.pre-multiplexer`, rewrites
-`Exec=ibus start --type wayland` to `Exec=ibus start`, and then prints the
+`Exec=ibus start --type wayland` to `Exec=ibus-daemon --xim --panel disable`,
+and then prints the
 steps below and stops. It deliberately does not stop, start or reconfigure
 anything that is running: the instant the slot changes hands is the one worth
 watching.
@@ -222,12 +223,14 @@ Then, by hand, in this order:
    line only takes effect at the next login:
 
        ibus exit
-       ibus start
+       ibus-daemon --xim --panel disable --daemonize
        pgrep -af -- --enable-wayland-im     # must print nothing
 
    ibus-daemon, mozc and the XIM server for XWayland clients all come back;
-   only the Wayland IM bridge and the panel do not. Typed CJK stops working
-   between these two commands and the next step.
+   only the Wayland IM bridge and the panel do not. Not `ibus start`: with no
+   `--type` it probes the compositor for the input-method protocol and, on
+   COSMIC, launches the bridge exactly as `--type wayland` would. Typed CJK
+   stops working between these two commands and the next step.
 3. Restart the applet, so it reads the new config and binds the slot: remove
    **Voice** from the panel and add it again through COSMIC's applet settings,
    or log out and back in.

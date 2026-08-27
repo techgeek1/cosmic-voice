@@ -32,8 +32,10 @@ Consequences, non-negotiable:
   no `unavailable` will ever arrive on our object under current smithay.
   Startup safety check: refuse to bind if an `ibus-ui-gtk3` process with
   `--enable-wayland-im` is running.
-- The autostart changes from `ibus start --type wayland` to plain
-  `ibus start`. ibus-daemon, mozc, and `--xim` (XWayland clients) all stay.
+- The autostart changes from `ibus start --type wayland` to
+  `ibus-daemon --xim --panel disable` — not a bare `ibus start`, which on a
+  Wayland session launches the bridge too (phase-5 finding 10). ibus-daemon,
+  mozc, and `--xim` (XWayland clients) all stay.
 - The smithay bug should be filed upstream (one rename plus object-identity
   checks in `add_instance` / `destroyed` / `GrabKeyboard`, which currently
   also let a superseded binder steal the grab).
@@ -915,7 +917,7 @@ corrections.
    time they set the mode, and it deserves a sentence naming the fix rather
    than a stack of `Failed` events. The applet turns it into
    "Input method: blocked — …" and a warning icon, and re-checks every five
-   seconds so that `ibus exit; ibus start` is noticed without an applet
+   seconds so that `ibus exit; ibus-daemon …` is noticed without an applet
    restart.
 
 7. **A commit that arrives outside `Dictating` is honoured, not dropped.** The
@@ -947,6 +949,23 @@ corrections.
    exist rather than creating one, which would race the script about to write
    to it.
 
+10. **A bare `ibus start` is `--type wayland` on COSMIC.** Found on the first
+    live attempt (2026-08-27): the cutover rewrote the autostart to
+    `Exec=ibus start`, the manual step ran it, and `ibus-ui-gtk3
+    --enable-wayland-im` came straight back with fresh timestamps. In ibus
+    1.5.34 `start_daemon_real` (`tools/main.vala:740`) tries the types in
+    order — wayland, kde-wayland, systemd, direct — until one succeeds, and
+    the wayland attempt succeeds whenever the compositor advertises
+    `zwp_input_method_manager_v2` (`registry_global_cb`, `main.vala:226`).
+    `--type wayland` only forbids the fallbacks. The only form that cannot
+    grow a bridge is running `ibus-daemon` itself with the arguments the
+    bridge would have passed it, `--xim --panel disable` (`main.vala:292`),
+    which is what the autostart now says and what the manual step runs (with
+    `--daemonize`, since it is typed into a terminal). `--type direct` is the
+    same thing spelled through `ibus`: it `execv`s `ibus-daemon` with whatever
+    options it did not recognise (`main.vala:806`), so the extra layer buys
+    nothing but a dependency on that behaviour staying put.
+
 ### What was verified, and how
 
 `scripts/im-harness/dictation-test.sh` is the phase-5 regression, all eight
@@ -967,7 +986,8 @@ What still needs a human: the cutover, unchanged, and now scripted as far as it
 safely can be. `scripts/cutover.sh` checks the preconditions, backs up
 `~/.config/autostart/ibus-wayland.desktop`, rewrites its one `Exec` line and
 then stops and prints the rest — retiring the running bridge with `ibus exit;
-ibus start`, setting the mode, restarting the applet, and what to do if the
+ibus-daemon --xim --panel disable --daemonize`, setting the mode, restarting
+the applet, and what to do if the
 keyboard dies. It deliberately stops and starts nothing: the instant the slot
 changes hands is the one worth watching. `scripts/rollback.sh` reverses it, in
 the reverse order, which matters — the multiplexer has to let go before IBus's
