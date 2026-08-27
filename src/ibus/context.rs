@@ -137,6 +137,26 @@ pub const META_MASK: u32 = 1 << 28;
 pub const RELEASE_MASK: u32 = 1 << 30;
 /// Every bit above that is a modifier rather than a marker.
 pub const MODIFIER_MASK: u32 = 0x5f00_1fff;
+/// The modifiers upstream considers capable of turning a key into a shortcut
+/// (`IBUS_MODIFIER_FILTER`, `ibustypes.h:387-398`): everything in
+/// [`MODIFIER_MASK`] except the two locks, the mouse buttons, and the three
+/// high-level aliases Super/Hyper/Meta that duplicate a Mod bit.
+///
+/// The frontend's "is this a plain printable keystroke" test is this set minus
+/// Shift. Deriving it from upstream rather than writing the bits out is what
+/// keeps Caps Lock and Num Lock from silently disabling the commit-as-text
+/// path, which is what happens if the test is `MODIFIER_MASK & !SHIFT_MASK`.
+pub const MODIFIER_FILTER: u32 = MODIFIER_MASK
+    & !(LOCK_MASK
+        | MOD2_MASK
+        | BUTTON1_MASK
+        | BUTTON2_MASK
+        | BUTTON3_MASK
+        | BUTTON4_MASK
+        | BUTTON5_MASK
+        | SUPER_MASK
+        | HYPER_MASK
+        | META_MASK);
 
 /// Renders a capability set for logs.
 pub fn describe_capabilities(caps: u32) -> String {
@@ -554,6 +574,68 @@ impl std::fmt::Display for ContextSignal {
 /// The interface signals arrive on, used to filter the message stream.
 const INPUT_CONTEXT_INTERFACE: &str = "org.freedesktop.IBus.InputContext";
 
+/// The decoded signal stream of one context, detachable from it.
+///
+/// It exists as a separate object because the frontend needs the two halves of
+/// a context on two threads: [`Context::process_key`] is called inline from the
+/// calloop loop, while something has to sit blocked in `next` so that signals
+/// arrive without polling. One `&mut Context` cannot be in both places, so the
+/// stream moves out with [`Context::take_signals`] and the rest of the context
+/// stays behind.
+///
+/// The stream also *ends* when the connection dies, which is precisely the
+/// signal the frontend needs to drop its context and start passing keys
+/// through raw until ibus-daemon comes back.
+pub struct SignalStream {
+    /// The object path whose signals this keeps; everything else is skipped.
+    path   : OwnedObjectPath,
+    /// The raw message stream underneath.
+    signals: Signals,
+}
+
+impl SignalStream {
+    /// Waits for the next signal addressed to this context.
+    ///
+    /// `None` means the timeout expired with nothing for us, or the connection
+    /// closed. Messages for other objects, and signals we do not decode, are
+    /// skipped without resetting the deadline.
+    pub fn next(&mut self, timeout: Option<Duration>) -> Result<Option<ContextSignal>> {
+        let deadline = timeout.map(|limit| Instant::now() + limit);
+
+        loop {
+            let remaining = match deadline {
+                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                    Some(remaining) => Some(remaining),
+                    None            => return Ok(None),
+                },
+                None => None,
+            };
+
+            let Some(message) = self.signals.next(remaining)? else {
+                return Ok(None);
+            };
+
+            let header = message.header();
+            if message.message_type() != zbus::message::Type::Signal {
+                continue;
+            }
+            if header.path().map(|path| path.as_str()) != Some(self.path.as_str()) {
+                continue;
+            }
+            if header.interface().map(|name| name.as_str()) != Some(INPUT_CONTEXT_INTERFACE) {
+                continue;
+            }
+            let Some(member) = header.member() else {
+                continue;
+            };
+
+            if let Some(signal) = decode_signal(member.as_str(), &message)? {
+                return Ok(Some(signal));
+            }
+        }
+    }
+}
+
 /// One input context, in the state the multiplexer needs.
 ///
 /// Created through [`super::Bus::create_input_context`], which applies the
@@ -576,8 +658,9 @@ pub struct Context {
     /// Proxy for the `Destroy` method, which lives on a different interface of
     /// the same object.
     service: ServiceProxy<'static>,
-    /// Everything the daemon sends us that is not a method reply.
-    signals: Signals,
+    /// Everything the daemon sends us that is not a method reply, until
+    /// [`Context::take_signals`] moves it to a thread of its own.
+    signals: Option<SignalStream>,
 }
 
 impl Context {
@@ -602,10 +685,13 @@ impl Context {
         proxy.set_capabilities(CAPABILITIES)?;
 
         Ok(Self {
-            path   : path,
+            path   : path.clone(),
             proxy  : proxy,
             service: service,
-            signals: signals,
+            signals: Some(SignalStream {
+                path   : path,
+                signals: signals,
+            }),
         })
     }
 
@@ -658,6 +744,15 @@ impl Context {
             .set_surrounding_text(&text.to_value()?, cursor, anchor)?)
     }
 
+    /// Tells the engine what kind of field has focus.
+    ///
+    /// Relayed from `text-input-v3`'s content type through the translation in
+    /// [`crate::im::content_type`]; engines act on it, mozc most visibly by
+    /// turning itself off in password fields.
+    pub fn set_content_type(&self, purpose: u32, hints: u32) -> Result<()> {
+        Ok(self.proxy.set_content_type((purpose, hints))?)
+    }
+
     /// Feeds one key through the engine and returns everything that came of
     /// it, synchronously. See the module documentation for why this blocks and
     /// why that is the correct design rather than a compromise.
@@ -679,48 +774,22 @@ impl Context {
 
     /// Waits for the next signal addressed to this context.
     ///
-    /// `None` means the timeout expired with nothing for us. Messages for
-    /// other objects, and signals we do not decode, are skipped without
-    /// resetting the deadline.
-    ///
-    /// The timeout loop is phase-1 scaffolding. Phase 2 puts the connection's
-    /// fd into calloop and decodes on readiness instead, which is why the
-    /// decoding is a free function over a message rather than something
-    /// tangled into the waiting.
+    /// Answers `Ok(None)` immediately once [`Context::take_signals`] has moved
+    /// the stream elsewhere, which is the frontend's arrangement; the polling
+    /// form is what the phase-1 devtest uses.
     pub fn next_signal(&mut self, timeout: Option<Duration>) -> Result<Option<ContextSignal>> {
-        let deadline = timeout.map(|limit| Instant::now() + limit);
-
-        loop {
-            let remaining = match deadline {
-                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
-                    Some(remaining) => Some(remaining),
-                    None            => return Ok(None),
-                },
-                None => None,
-            };
-
-            let Some(message) = self.signals.next(remaining)? else {
-                return Ok(None);
-            };
-
-            let header = message.header();
-            if message.message_type() != zbus::message::Type::Signal {
-                continue;
-            }
-            if header.path().map(|path| path.as_str()) != Some(self.path.as_str()) {
-                continue;
-            }
-            if header.interface().map(|name| name.as_str()) != Some(INPUT_CONTEXT_INTERFACE) {
-                continue;
-            }
-            let Some(member) = header.member() else {
-                continue;
-            };
-
-            if let Some(signal) = decode_signal(member.as_str(), &message)? {
-                return Ok(Some(signal));
-            }
+        match self.signals.as_mut() {
+            Some(signals) => signals.next(timeout),
+            None          => Ok(None),
         }
+    }
+
+    /// Detaches the signal stream, so a thread of its own can block on it.
+    ///
+    /// `None` on the second call: there is exactly one stream and whoever took
+    /// it owns it. See [`SignalStream`] for why the split exists.
+    pub fn take_signals(&mut self) -> Option<SignalStream> {
+        self.signals.take()
     }
 }
 

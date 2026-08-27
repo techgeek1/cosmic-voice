@@ -64,6 +64,21 @@ impl Address {
     /// display and [`Error::DaemonGone`] when it has run and exited, because
     /// the caller wants to log those differently even though both mean "fall
     /// back to passing keys through".
+    /// Wraps an address the caller already has.
+    ///
+    /// The frontend takes one on the command line so a test harness can point
+    /// it at a scratch daemon without setting `IBUS_ADDRESS` for the whole
+    /// process — which would also redirect anything else in it. No PID comes
+    /// with an address given this way, so no liveness check is possible; a
+    /// caller that supplies one is asserting the daemon exists.
+    pub fn explicit(address: impl Into<String>) -> Self {
+        Self {
+            address: address.into(),
+            pid    : None,
+            source : Source::Environment,
+        }
+    }
+
     pub fn discover() -> Result<Self> {
         if let Ok(address) = std::env::var("IBUS_ADDRESS")
             && !address.is_empty()

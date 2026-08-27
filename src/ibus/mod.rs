@@ -27,12 +27,14 @@
 //!
 //! # Threading
 //!
-//! Everything here is blocking, and `zbus`'s blocking API drives its own
-//! runtime internally. That means **no method on any of these types may be
-//! called from inside a tokio runtime** — `Runtime::block_on` panics when it is
-//! re-entered. This is not a limitation in practice: the design puts the whole
-//! IM stack on a dedicated calloop thread precisely because the key path
-//! blocks, and the engine's tokio loop must never wait behind it.
+//! Everything here is blocking. `zbus` is built with its `async-io` reactor, so
+//! the connection's socket is driven on an executor thread zbus owns and these
+//! methods merely park the calling thread until the reply lands — they are
+//! legal from any plain thread, which is what [`crate::im`]'s calloop loop
+//! relies on when it calls [`context::Context::process_key`] inline. What they
+//! must not do is run on the engine's tokio loop: parking that thread for an
+//! engine round-trip stalls dictation, which is the reason the IM stack has a
+//! thread of its own in the first place.
 
 mod address;
 mod bus;
@@ -41,7 +43,12 @@ mod text;
 
 pub use address::Address;
 pub use bus::Bus;
-pub use context::{CAPABILITIES, Context, RELEASE_MASK, describe_capabilities};
+pub use context::{
+    CAPABILITIES, CONTROL_MASK, Context, ContextSignal, HYPER_MASK, KeyOutcome, LOCK_MASK,
+    META_MASK, MOD1_MASK, MOD2_MASK, MOD3_MASK, MOD4_MASK, MOD5_MASK, MODIFIER_FILTER,
+    PREEDIT_COMMIT, PostRecord, RELEASE_MASK, SHIFT_MASK, SUPER_MASK, SignalStream,
+    describe_capabilities, describe_state,
+};
 pub use text::Text;
 
 use std::path::PathBuf;
@@ -186,23 +193,20 @@ impl Signals {
     /// call, which is where a useful error comes from.
     fn next(&mut self, timeout: Option<Duration>) -> Result<Option<zbus::message::Message>> {
         use futures::StreamExt;
+        use futures::future::{Either, select};
 
-        // `zbus::block_on` rather than a runtime of our own. Polling a
-        // `MessageStream` ticks the connection's internal executor, which owns
-        // the tokio socket, so it has to happen inside the runtime zbus built
-        // the connection on — doing it from a second runtime panics with
-        // "there is no reactor running". The function is what zbus's own
-        // documentation examples use for exactly this, and the runtime it
-        // enters has both the IO and timer drivers enabled, which is what makes
-        // `tokio::time::timeout` legal here.
+        // `zbus::block_on` only parks this thread until the message lands: with
+        // the `async-io` reactor, zbus drives the connection's socket on an
+        // executor thread of its own, so nothing here has to be inside a
+        // particular runtime. That is the whole reason phase 2 chose async-io
+        // over tokio — under the tokio feature this call had to carry its timer
+        // into the future to avoid "there is no reactor running", and the
+        // calloop thread could not have called it at all.
         let next = self.stream.next();
         let message = match timeout {
-            // The timeout future is built *inside* the block, not passed in:
-            // constructing a tokio timer registers it with the current
-            // runtime, and there is none until `block_on` enters one.
-            Some(limit) => match zbus::block_on(async { tokio::time::timeout(limit, next).await }) {
-                Ok(message) => message,
-                Err(_)      => return Ok(None),
+            Some(limit) => match zbus::block_on(select(next, async_io::Timer::after(limit))) {
+                Either::Left((message, _)) => message,
+                Either::Right(_)           => return Ok(None),
             },
             None => zbus::block_on(next),
         };

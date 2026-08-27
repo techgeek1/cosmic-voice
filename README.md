@@ -53,20 +53,46 @@ machine.
 `docs/multiplexer.md` designs the next version: one process owns the seat's
 `zwp_input_method_v2` slot and multiplexes it between dictation and IBus, so
 typed CJK and spoken text stop competing for a compositor slot that has no
-sharing semantics. Phase one of it is in the tree and nothing shipped uses it
-yet. `src/ibus` is a hand-written D-Bus client for ibus-daemon's own private
-bus: address discovery, the `IBusSerializable` codec for preedit, candidates
-and engine descriptions, and the synchronous key path where `ProcessKeyEvent`
-blocks and the effects it withheld are drained back out of a property. There
-is no Wayland side to it, so it neither binds the input-method slot nor
-changes how anything types today.
+sharing semantics. Phases one and two are in the tree; nothing shipped uses
+them yet, and the applet's behaviour is unchanged.
 
-Two hidden devtests exercise it. `cosmic-voice devtest ibus-info` is read-only
-— it connects, decodes the engine registry and reports what the daemon says —
-and is safe to run at any time. `cosmic-voice devtest ibus-keys <engine>
-<key>…` feeds a scripted key sequence to a real engine and prints what came
-back; it is **attended only**, because taking IBus focus takes it away from
-whatever window you were actually typing in until it exits.
+`src/ibus` is the upstream leg: a hand-written D-Bus client for ibus-daemon's
+own private bus, with address discovery, the `IBusSerializable` codec for
+preedit, candidates and engine descriptions, and the synchronous key path
+where `ProcessKeyEvent` blocks and the effects it withheld are drained back
+out of a property.
+
+`src/im` is the downstream leg: the Wayland input method. It binds the slot on
+a named display, takes a keyboard grab and a virtual keyboard for as long as a
+text field has focus, resolves each key through the compositor's own keymap,
+asks the engine about it, and then either lets the engine's commit stand,
+types the character as text, or replays the key to the application untouched.
+It runs one calloop loop over the Wayland connection, a channel carrying
+IBus's asynchronous signals, and a timer that does key repeat and
+reconnection. Candidates are received but not yet drawn, so mozc conversion
+works blind — that is phase three.
+
+The routing rules are a pure function in `im/router.rs` with unit tests, which
+is the part that can be checked without a compositor. The rest is checked by
+`scripts/im-harness/frontend-test.sh`, which starts a nested cosmic-comp, an
+isolated ibus-daemon with mozc, a GTK entry and the frontend, injects keys over
+libei, and asserts that `konnnitiha` comes out of the entry as こんにちは, that
+plain keys arrive as committed text, that Ctrl-A still reaches the application
+as a key, that a held key repeats at the right rate, and that killing
+ibus-daemon leaves typing working. None of it touches the live session.
+
+Three hidden devtests exercise the two legs. `cosmic-voice devtest ibus-info`
+is read-only — it connects, decodes the engine registry and reports what the
+daemon says — and is safe to run at any time. `cosmic-voice devtest ibus-keys
+<engine> <key>…` feeds a scripted key sequence to a real engine and prints
+what came back; it is **attended only**, because taking IBus focus takes it
+away from whatever window you were actually typing in until it exits.
+`cosmic-voice devtest im-frontend <wayland-display> [ibus-address]` runs the
+frontend itself, and **refuses to run on the display it inherited**: binding
+a second input method on a seat that already has one does not fail cleanly on
+cosmic-comp, it wedges the keyboard session-wide, so the display is named
+explicitly and the live one has to be asked for with `--live-i-know`. Point it
+at a nested compositor.
 
 ## Setup
 
@@ -118,3 +144,4 @@ rest mirror it, so every panel icon works and nothing runs multiplied.
 | `transcript_log.rs` | raw transcript corpus, one JSON line per utterance |
 | `app.rs`       | panel applet, icon and settings popup             |
 | `ibus/`        | D-Bus client for ibus-daemon, the multiplexer's upstream leg |
+| `im/`          | Wayland input-method frontend, the multiplexer's downstream leg |

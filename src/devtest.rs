@@ -36,10 +36,14 @@ pub fn run(args: &[String]) -> Result<()> {
         // running this has wedged all keyboard input; recovery is
         // `ibus exit; pkill -f ibus-ui-gtk3`. Run only deliberately.
         [c] if c == "inject-probe-im"    => inject_probe(true),
+        // DANGER for the same reason, which is why it takes the display to
+        // bind as an argument and refuses this process's own.
+        [c, rest @ ..] if c == "im-frontend" => im_frontend(rest),
         _ => Err(anyhow!(
             "checks: decode <model_dir> <wav> [threads] | stream <model_dir> <wav> [threads] | \
              finalize <model_dir> <wav> [threads] | capture <secs> | keys | rebind | \
-             inject-probe | type <secs> <text> | ibus-info | ibus-keys <engine> <key>…"
+             inject-probe | type <secs> <text> | ibus-info | ibus-keys <engine> <key>… | \
+             im-frontend <wayland-display> [ibus-address]"
         )),
     }
 }
@@ -500,6 +504,45 @@ fn parse_key_spec(spec: &str) -> Result<(u32, u32)> {
     let keycode = if evdev == 0 { 0 } else { evdev + 8 };
 
     Ok((keysym.raw(), keycode))
+}
+
+/// Runs the Wayland input-method frontend in the foreground.
+///
+/// **Nested compositors only.** Binding `zwp_input_method_v2` on a seat that
+/// already has an input method does not fail cleanly on cosmic-comp: the
+/// existing holder is told it is unavailable, drops its input method but not
+/// its keyboard grab, and the session loses its keyboard until that process
+/// dies. So the display is named explicitly and this refuses the one the
+/// process inherited. `--live-i-know` overrides that, and is for the attended
+/// cutover only — [`crate::im::run`] enforces the same rule again, so the
+/// flag has to be passed deliberately rather than reached by accident.
+///
+/// The optional ibus address points the frontend at a scratch daemon without
+/// setting `IBUS_ADDRESS` for anything else in the process.
+fn im_frontend(args: &[String]) -> Result<()> {
+    let mut display = None;
+    let mut address = None;
+    let mut allow_live = false;
+    for argument in args {
+        match argument.as_str() {
+            "--live-i-know"           => allow_live = true,
+            _ if display.is_none()    => display = Some(argument.clone()),
+            _ if address.is_none()    => address = Some(argument.clone()),
+            other                     => return Err(anyhow!("unexpected argument {other:?}")),
+        }
+    }
+
+    let Some(display) = display else {
+        return Err(anyhow!(
+            "usage: cosmic-voice devtest im-frontend <wayland-display> [ibus-address]"
+        ));
+    };
+
+    crate::im::run(crate::im::Options {
+        display     : display,
+        ibus_address: address,
+        allow_live  : allow_live,
+    })
 }
 
 /// Indents a multi-line block for the report layout.

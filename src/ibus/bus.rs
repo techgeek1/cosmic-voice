@@ -180,7 +180,11 @@ pub struct Bus {
 impl Bus {
     /// Discovers the daemon and connects to it.
     pub fn connect() -> Result<Self> {
-        let address = Address::discover()?;
+        Self::connect_to(Address::discover()?)
+    }
+
+    /// Connects to a daemon whose address the caller already knows.
+    pub fn connect_to(address: Address) -> Result<Self> {
         let connection = zbus::blocking::connection::Builder::address(address.address.as_str())?
             .build()?;
         let daemon = DaemonProxy::new(&connection)?;

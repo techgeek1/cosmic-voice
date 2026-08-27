@@ -285,9 +285,10 @@ rollback is trivial because nothing outside cosmic-voice changed permanently.
 
 ## Build strategy (banked 2026-08-25)
 
-Status: **phase 1 done (2026-08-26)**, `src/ibus/` — see the findings
-section below for what implementing it corrected in this document. Phases
-2–5 not started.
+Status: **phases 1 and 2 done (2026-08-26)**, `src/ibus/` and `src/im/` — see
+the findings sections below for what implementing them corrected in this
+document. Phase 2 is code-complete and unit-tested but has not yet been run
+against a live seat; phases 3–5 not started.
 
 Implementation will be agent-driven, which changes the bottleneck: the
 mechanical bulk (proxies, codec, relay tables) is hours of wall clock, and the
@@ -383,3 +384,153 @@ turned up these corrections. Citations are into the 1.5.34 tree.
    every press `handled=true`, preedit arrives in the drain as `'m'` records
    with `mode=commit`, lookup tables and auxiliary text arrive as ordinary
    signals, `CommitText` lands in the drain on Return. The sync contract holds.
+
+## Findings from phase 2 (2026-08-26)
+
+Building the Wayland frontend against cosmic-comp's protocols, ibus 1.5.34's
+bridge and xkbcommon turned up these corrections. Citations are into ibus
+1.5.34 and the protocol XML shipped in `wayland-protocols-misc 0.3.12`.
+
+1. **The event-loop problem dissolves; open decision 1 is closed by neither of
+   its options.** Building zbus with `default-features = false, features =
+   ["blocking-api", "async-io"]` puts the connection's executor on a thread
+   zbus owns, so the blocking proxies park only the calling thread and work
+   from anywhere. No fd is registered with calloop and nothing ticks zbus's
+   executor; the calloop thread simply calls `Context::process_key` inline and
+   blocks for the engine round-trip, which is the contract the sync key path
+   wanted in the first place. This supersedes finding 3 from phase 1 — the
+   `tokio::time::timeout`-inside-`block_on` construction is gone with it.
+2. **One context needs two threads.** `process_key` is called inline from the
+   loop, and *something* must stay blocked in the signal stream because zbus's
+   per-stream queue is bounded (64) and a full queue stalls the whole
+   connection. One `&mut Context` cannot be in both places, so
+   `Context::take_signals` detaches the stream and it moves to a thread whose
+   only job is to forward into a `calloop::channel`. The stream ending is also
+   the daemon-death detector, which is more reliable than watching for a
+   transport error on a call nobody happened to make.
+3. **The key routing list needs a rule 0: with no IBus context, replay
+   everything.** Rule 3 as written commits plain printable presses as text,
+   which while ibus-daemon is restarting turns every keystroke into committed
+   text — nearly right, and wrong exactly where it matters, because an
+   application that acts on key events sees none. "Keys pass through raw" in
+   the failure story has to be a routing rule, not an aspiration.
+4. **`IBUS_MODIFIER_MASK & ~IBUS_SHIFT_MASK` is the wrong test for "plain".**
+   It includes Caps Lock and Num Lock, so either one being on silently
+   disables commit-as-text for as long as it stays on. Upstream already
+   defines the right set: `IBUS_MODIFIER_FILTER` (`ibustypes.h:387-398`)
+   excludes both locks, the mouse buttons, and the Super/Hyper/Meta aliases.
+   The test is `MODIFIER_FILTER & ~SHIFT_MASK`. IBus's own bridge avoids the
+   bug only by accident, by never reporting a lock at all (next finding).
+5. **Modifiers come from `modifiers` events alone.** The bridge drives the xkb
+   state from both `xkb_state_update_mask` and `xkb_state_update_key`
+   (`ibuswaylandim.c:1240` against `:1708-1745`), which xkbcommon documents as
+   alternatives — running both double-counts a latch. We use the mask path
+   only, as every ordinary Wayland client does, and serialise the *locked*
+   component as well as depressed and latched, so Caps Lock reaches the engine
+   as `IBUS_LOCK_MASK` the way it does from GTK. The bridge serialises
+   depressed|latched and cannot.
+6. **Which keys repeat is a keymap question, not a policy one.**
+   "Re-inject presses at delay/rate" repeats held modifiers too.
+   `xkb_keymap_key_repeats()` answers it per keycode and nothing else does.
+   The rate bug the doc identified is real and confirmed: `rate` is characters
+   per second, so the period is `1000/rate` ms.
+7. **text-input-v3 and IBus renumber `terminal`.** Purpose 13 against 10,
+   which shifts date, time and datetime by one; and the hint bits share no
+   positions at all. The doc pointed at the bridge's table without saying that
+   a cast is actively wrong rather than merely unidiomatic.
+8. **`delete_surrounding_text` cannot express every IBus request, and the
+   bridge's version of it has never run.** IBus names a character range
+   relative to the caret which need not contain it; text-input-v3 names a byte
+   count before the caret and one after, so its range always does. We extend
+   the range to reach the caret, over-deleting rather than under-deleting, on
+   the grounds that an engine and an application disagreeing about the text is
+   the worse failure. Upstream clamps with `offset = MIN (offset, 0)`
+   (`ibuswaylandim.c:752`), which underflows the unsigned `after_length` for a
+   forward-only range — but the entire surrounding-text path there, including
+   `SetSurroundingText` and `RequireSurroundingText`, sits inside
+   `#if ENABLE_SURROUNDING`, which is not defined. **There is no working
+   reference implementation of surrounding text on this protocol.** Ours is
+   the first, so it is the part of phase 2 most likely to diverge in practice.
+9. **A `commit(serial)` with no preedit beside it clears the preedit.** Pending
+   state that is unset is empty, so "every text operation is its own commit"
+   has a consequence: a commit-only operation empties the preedit as a side
+   effect. That is what engines want — they emit commit-then-preedit — but an
+   engine emitting them in the other order would lose the preedit, and the
+   rule reads as neutral in the design.
+10. **The "data-loss bug we fix for free" cannot be fixed on focus change, and
+    trying leaks the text into the next window.** The design's claim was that
+    holding the preedit under `ClientCommitPreedit` lets us commit a
+    half-finished conversion that IBus's bridge discards. Measured in the
+    harness: with 「こ」 pending in window A, moving focus to window B put
+    「こ」 **into B**. The mechanism is smithay's handler — `CommitString` is
+    `with_active_text_input(|ti, _| ti.commit_string(…))`
+    (`input_method_handle.rs:207-211`), so the text goes to whichever text
+    input is active when the *compositor* processes the request, not the one
+    that was focused when we sent it. By the time `deactivate` reaches us the
+    old field is gone and the new one may already be in.
+    text-input-v3 has no way to express "commit into the field that is
+    leaving", so on a focus change the preedit is lost exactly as it is with
+    the bridge. The flush is now guarded on still being active: it is a no-op
+    on `deactivate` and correct on the `Reset` path, which is the one phase 5
+    actually needs. Losing a preedit is bad; typing it into a different
+    application is worse.
+11. **A forwarded key with keycode 0 cannot be replayed.** A virtual keyboard
+    sends keycodes, not keysyms, so an engine forwarding a bare keysym would
+    need a keymap synthesised for it — the trick `inject.rs` already does for
+    dictation. Logged and dropped for now, which is where the bridge left it
+    too (`ibus_wayland_im_keysym` is `g_warning ("TODO")` on v2).
+12. **The startup safety check in the doc is necessary but nowhere near
+    sufficient.** "Refuse to bind if `ibus-ui-gtk3 --enable-wayland-im` is
+    running" says nothing about the case where it is *not* running and the
+    display is still the live seat the user is typing on. `im::run` takes the
+    display name as an argument and refuses the one the process inherited from
+    `$WAYLAND_DISPLAY` unless explicitly overridden, so the dangerous case has
+    to be asked for rather than reached. The bridge check stays, hard-failing
+    on the live display and warning on a nested one, where the other seat
+    makes it harmless.
+
+13. **The smithay `add_instance` behaviour reproduced, and it is survivable
+    when *we* are the victim.** Two frontends were accidentally run against the
+    nested compositor at once. The second one bound successfully and the first
+    received `unavailable` — the new binder wins, the existing holder is
+    evicted, exactly as `input_method_handle.rs:58-69` predicts. Our handler
+    logs and stops the loop, and stopping destroys the grab object, so key flow
+    was restored immediately. That is the difference between us and IBus's
+    bridge in the 2026-08 incident: the bridge destroys its input method and
+    keeps its grab, and it is the orphaned grab, not the eviction, that kills
+    the session. Worth carrying into the upstream bug report as the contrast
+    case.
+
+Confirmed rather than corrected: `zwp_input_method_v2` on the live session is
+held by `ibus-ui-gtk3 --enable-wayland-im` right now (pid 1985886), exactly as
+the doc's first section describes, so the phase-2 cutover is an attended
+operation that starts by changing the autostart line.
+
+### What was verified, and how
+
+`scripts/im-harness/` builds the whole loop with no live-session component:
+a nested cosmic-comp under winit, an isolated ibus-daemon and mozc on a private
+D-Bus session bus, a GTK3 `Gtk.Entry` speaking text-input-v3, and key injection
+over libei. The last of those is the piece the design was unsure about, and it
+works: cosmic-comp never listens on an EIS socket, but it hands one out over
+`com.system76.CosmicComp.Ei.GetSenderSocket` on its own bus, and keys injected
+that way traverse the shortcut filter and the input-method grab — the full
+path, unlike virtual-keyboard keys, which bypass both.
+
+`scripts/im-harness/frontend-test.sh` is the one-command regression, all seven
+assertions green on 2026-08-27:
+
+- mozc converts `konnnitiha` to こんにちは and Return commits it into the entry;
+- with `xkb:us::eng`, unhandled plain keys arrive as committed text (rule 3);
+- Ctrl-A reaches the application as a key (it selects all, and the next
+  character replaces the field);
+- a key held for 1.5s repeats 23 times — one press plus twenty-two at 40ms,
+  measured 601ms delay and 41ms period, against the ~36 the bridge's
+  rate-as-period bug would give;
+- killing ibus-daemon leaves the frontend running and keys reaching the
+  application as raw key events.
+
+What still needs a human: anything on the live seat (the cutover itself), and
+the visual pass — the nested compositor renders on the live desktop but there
+is no scripted screenshot, so preedit styling and, from phase 3, the candidate
+window are looked at rather than asserted.

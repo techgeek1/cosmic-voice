@@ -1150,6 +1150,9 @@ name = "cosmic-voice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-io",
+ "calloop",
+ "calloop-wayland-source",
  "cosmic-client-toolkit 0.2.0 (git+https://github.com/pop-os/cosmic-protocols?rev=160b086)",
  "cosmic-config",
  "futures",

@@ -17,6 +17,7 @@ mod devtest;
 mod engine;
 mod hotkey;
 mod ibus;
+mod im;
 mod inject;
 mod ipc;
 mod toplevel;
@@ -29,9 +30,17 @@ use tracing_subscriber::EnvFilter;
 
 /// Entry point. Dispatches between applet and client roles.
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // The applet stays quiet unless RUST_LOG asks for something, because it is
+    // a panel process nobody is watching. A devtest is the opposite: it exists
+    // to be watched, and one that printed nothing about what it was doing to
+    // the input method would be useless.
+    let devtest = std::env::args().nth(1).as_deref() == Some("devtest");
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter)            => filter,
+        Err(_) if devtest     => EnvFilter::new("cosmic_voice=info"),
+        Err(_)                => EnvFilter::from_default_env(),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Anything past argv[0] means we are the client. Deliberately hand-rolled:
     // three verbs do not justify a dependency, and the applet path must not pay

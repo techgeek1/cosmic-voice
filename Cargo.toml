@@ -68,13 +68,27 @@ xkbcommon               = "0.8"
 # 2022 — so the proxies live in `src/ibus`.
 #
 # The blocking API on purpose: the key path is a synchronous ProcessKeyEvent
-# followed by a property read, and the thread that will own it runs calloop, not
-# tokio. `default-features = false` drops zbus's `async-io` reactor in favour of
-# `tokio`, which this binary already links; `blocking-api` is what generates the
-# synchronous proxies. Note that other crates in the tree still pull zbus with
-# its defaults, so async-io survives feature unification — this declaration just
-# stops *us* being the reason for it.
-zbus = { version = "5", default-features = false, features = ["blocking-api", "tokio"] }
+# followed by a property read, and the thread that owns it runs calloop, not
+# tokio. `blocking-api` is what generates the synchronous proxies.
+#
+# `async-io` rather than `tokio` as the reactor, which is not a stylistic
+# choice: with the tokio feature the connection's internal executor holds a
+# tokio socket, so every call into it has to happen inside `zbus::block_on` and
+# a timer built in the same future (phase-1 finding 3). async-io's reactor runs
+# on a thread of zbus's own, so the blocking proxies work from any plain thread
+# — which is what lets the calloop thread call `process_key` directly.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+# The event loop for the input-method thread (`src/im`). One loop over the
+# Wayland fd, the IBus signal channel and the key-repeat timer; wayland-client's
+# `EventQueue` joins it through `calloop-wayland-source`, which owns the
+# read-guard dance that a hand-rolled poll would have to get right.
+calloop                = "0.14"
+calloop-wayland-source = "0.4"
+
+# zbus's reactor, named here only for its timer: bounding a signal wait needs a
+# timer the same executor understands, and `tokio::time` is not it any more.
+async-io = "2"
 
 # Focused-window app_id, used to pick a per-application vocabulary prompt.
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
