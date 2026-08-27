@@ -1252,13 +1252,18 @@ these corrections. Citations are into the 1.5.34 tree unless stated.
     is in place for it. The harness entry client grew `blur`/`focus` stdin
     commands to reproduce it (property-test.sh 5b).
 
-11. **The panel button must not change size.** cosmic-panel sizes an applet
-    from what it first draws; a button that grows when mozc's あ appears and
-    shrinks when an xkb engine takes over is clipped at the old width until
-    something else triggers a relayout — seen live as an icon "cut off at
-    random". The glyph's slot is reserved (icon-sized, blank when there is
-    no indicator) for as long as the multiplexer is running, so the only
-    size change is the one when the mode turns on.
+11. **The applet window is one icon wide unless told otherwise.** libcosmic
+    sizes an applet's main window to `suggested_window_size` — one icon plus
+    padding (`src/applet/mod.rs:140`) — and clips whatever is drawn outside
+    it. A button with a glyph beside the icon is wider than that, so the
+    icon showed cut in half and the glyph was never visible at all, which
+    read as "the UI does not redraw". The fix is `autosize_window`, the
+    wrapper the clock applet uses to let the window follow its content and
+    the panel re-lay out on the resize. The glyph's slot is still reserved
+    (icon-sized, blank without an indicator) while the multiplexer runs, so
+    the width does not flap with every engine switch. A pick in the popup
+    also closes it, which is what hands focus back to the field and lets the
+    held activation (finding 10) apply.
 
 ### What was verified, and how
 

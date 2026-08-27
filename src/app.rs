@@ -183,9 +183,17 @@ impl cosmic::Application for App {
                     let _ = handle.commands.try_send(Command::Rebind);
                 }
             }
+            // Both close the popup, like a menu does on a pick — and not only
+            // for the feel of it. A mode activation is held by the frontend
+            // until a text field is active again (ibus detaches the engine
+            // from an unfocused context), and the popup is what took the
+            // field's focus; closing it is what gives the focus back.
             Message::SetEngine(index) => {
                 if let (Some(handle), Some(engine)) = (ENGINE.get(), self.engine_cycle().get(index)) {
                     let _ = handle.commands.try_send(Command::SetEngine(engine.name.clone()));
+                }
+                if let Some(popup) = self.popup.take() {
+                    return destroy_popup(popup);
                 }
             }
             Message::ActivateProperty { key, state } => {
@@ -194,6 +202,9 @@ impl cosmic::Application for App {
                         key  : key,
                         state: state,
                     });
+                }
+                if let Some(popup) = self.popup.take() {
+                    return destroy_popup(popup);
                 }
             }
         }
@@ -236,12 +247,9 @@ impl cosmic::Application for App {
         // relayout when the mode turns on is fine; one per engine switch is
         // a button that is cut off at random.
         if !matches!(self.input_method, InputMethodState::Running { .. }) {
-            return self
-                .core
-                .applet
-                .icon_button(name)
-                .on_press_down(Message::TogglePopup)
-                .into();
+            let button = self.core.applet.icon_button(name).on_press_down(Message::TogglePopup);
+
+            return self.core.applet.autosize_window(button).into();
         }
 
         let (width, _) = self.core.applet.suggested_size(true);
@@ -268,11 +276,17 @@ impl cosmic::Application for App {
         };
         let padding = if self.core.applet.is_horizontal() { [minor, major] } else { [major, minor] };
 
-        button::custom(content)
+        let button = button::custom(content)
             .padding(padding)
             .class(cosmic::theme::Button::AppletIcon)
-            .on_press_down(Message::TogglePopup)
-            .into()
+            .on_press_down(Message::TogglePopup);
+
+        // The applet's window is sized for one icon (`suggested_window_size`)
+        // unless the content is wrapped in `autosize_window`, which is what
+        // lets the window — and with it the panel's layout — follow the
+        // content instead of clipping it to that box. Without this the glyph
+        // is drawn outside the visible window and the icon is cut at its edge.
+        self.core.applet.autosize_window(button).into()
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
