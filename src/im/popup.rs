@@ -6,8 +6,8 @@
 //!
 //! # Lifecycle: one surface, for the life of the process
 //!
-//! The popup surface is created once, at bind time, and never destroyed —
-//! *not* per activation alongside the grab and the virtual keyboard. The
+//! The popup surface is created once, at bind time, and lives as long as the
+//! process — *not* per activation alongside the grab and the virtual keyboard. The
 //! protocol makes the compositor responsible for visibility ("visible if and
 //! only if the input method is in the active state",
 //! `input-method-unstable-v2.xml:366-375`), so there is nothing an
@@ -36,14 +36,17 @@
 //!
 //! # Redraw
 //!
-//! At most one buffer per frame. The lookup-table signals arrive in bursts —
-//! mozc sends `UpdateAuxiliaryText`, `UpdateLookupTable` and often a preedit
-//! update for a single keystroke — so a redraw per signal would be three
-//! buffers for one visible change. State changes only set a dirty flag; the
-//! actual paint happens when the compositor's last `wl_surface.frame` callback
-//! says it is ready for another one.
+//! Coalesced twice. The lookup-table signals arrive in bursts — one keystroke
+//! through mozc produces `UpdateAuxiliaryText` and `UpdateLookupTable`, and a
+//! commit produces `HideLookupTable` then `HideAuxiliaryText` — each as its own
+//! callback on the signal channel, so a paint per signal would attach a buffer
+//! for a state nobody should see. State changes therefore only set a dirty flag
+//! and [`Popup::flush`] draws once per event-loop pass, after the whole burst
+//! has been applied. On top of that, `wl_surface.frame` throttles to one buffer
+//! per frame.
 
 use std::fs::File;
+use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 
 use tiny_skia::Pixmap;
@@ -107,8 +110,8 @@ struct Slot {
 pub struct Popup {
     /// The surface the pixels go on.
     surface   : wl_surface::WlSurface,
-    /// The role object. Kept alive for as long as the surface, and never used
-    /// for anything but receiving `text_input_rectangle`.
+    /// The role object. It carries no requests but `destroy`; its whole
+    /// purpose is to have been created, and to deliver `text_input_rectangle`.
     role      : ZwpInputPopupSurfaceV2,
     /// The shared-memory pool the buffers live in.
     pool      : wl_shm_pool::WlShmPool,
@@ -183,7 +186,7 @@ impl Popup {
 
         let surface = compositor.create_surface(qh, ());
         let role = im.get_input_popup_surface(&surface, qh, ());
-        let pool = shm.create_pool(memory.as_fd_borrowed(), total as i32, qh, ());
+        let pool = shm.create_pool(memory.as_fd(), total as i32, qh, ());
 
         let palette = Palette::load();
         tracing::info!("candidate palette from {}", palette.source);
@@ -683,22 +686,6 @@ impl Popup {
             slot.busy = false;
         }
         self.paint();
-    }
-}
-
-/// Borrowing the memfd as the `wl_shm` request wants it.
-///
-/// A free function rather than an inline `as_fd()` because `std::fs::File`'s
-/// `AsFd` and wayland-client's `BorrowedFd` argument only line up through the
-/// trait, and importing it at the one call site reads worse than naming it.
-trait AsFdBorrowed {
-    /// The file's descriptor, borrowed for the length of the call.
-    fn as_fd_borrowed(&self) -> std::os::fd::BorrowedFd<'_>;
-}
-
-impl AsFdBorrowed for File {
-    fn as_fd_borrowed(&self) -> std::os::fd::BorrowedFd<'_> {
-        std::os::fd::AsFd::as_fd(self)
     }
 }
 
