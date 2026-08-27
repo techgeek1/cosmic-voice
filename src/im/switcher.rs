@@ -592,6 +592,15 @@ impl Switcher {
 
         self.choose_engine_if_none();
         self.publish(ImEvent::Engines(self.cycle()));
+        // The engine the daemon already had before we connected: `describe`
+        // has run, so this is the marked selection and the mode glyph the
+        // applet shows from the start rather than only after the first
+        // switch. When `choose_engine_if_none` set one instead, `current` is
+        // still `None` here and the `GlobalEngineChanged` it triggers
+        // publishes it.
+        if let Some(current) = self.current.clone() {
+            self.publish(ImEvent::EngineChanged(self.described_engine(&current)));
+        }
 
         Ok(())
     }
@@ -794,15 +803,20 @@ impl Switcher {
             }
         }
 
-        let engine = match self.described.get(&name) {
-            Some(described) => described.to_ipc(&name),
+        self.publish(ImEvent::EngineChanged(self.described_engine(&name)));
+    }
+
+    /// The display form of one engine, from the description cache, falling
+    /// back to the bare id when the registry never described it.
+    fn described_engine(&self, name: &str) -> ImEngine {
+        match self.described.get(name) {
+            Some(described) => described.to_ipc(name),
             None            => ImEngine {
-                name    : name.clone(),
+                name    : name.to_owned(),
                 symbol  : String::new(),
-                longname: name,
+                longname: name.to_owned(),
             },
-        };
-        self.publish(ImEvent::EngineChanged(engine));
+        }
     }
 
     /// Tears the panel connection down after the daemon went away.

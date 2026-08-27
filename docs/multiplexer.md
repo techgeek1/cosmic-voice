@@ -1252,6 +1252,23 @@ these corrections. Citations are into the 1.5.34 tree unless stated.
     is in place for it. The harness entry client grew `blur`/`focus` stdin
     commands to reproduce it (property-test.sh 5b).
 
+12. **A broadcast event does not wake the applet's Wayland loop, so the panel
+    glyph lags until the loop turns over for another reason.** Reported live:
+    the mode indicator updated "many seconds later", and hovering the panel or
+    opening the popup snapped it to the right glyph at once. Engine events
+    reach the applet on a `tokio::broadcast` written from the engine's thread
+    (directly when the applet is primary, via the control socket when it is a
+    mirror); the cross-thread wake that should make iced's winit loop drain the
+    subscription is dropped, so the message waits for the next pointer motion
+    or popup toggle. Confirmed by watching the socket: the `InputMethod` event
+    is delivered within a second, it is the repaint that waits. The fix is a
+    200 ms `iced::time::every` tick, live only while something can change
+    without input (the multiplexer running, or a transient engine state), which
+    turns the loop over often enough to drain a pending event. The same
+    connect also now publishes the current engine (the switcher had published
+    only the cycle, so the marked selection and glyph appeared only after the
+    first switch).
+
 11. **The applet window is one icon wide unless told otherwise.** libcosmic
     sizes an applet's main window to `suggested_window_size` — one icon plus
     padding (`src/applet/mod.rs:140`) — and clips whatever is drawn outside

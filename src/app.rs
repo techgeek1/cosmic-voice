@@ -84,6 +84,9 @@ pub enum Message {
     SetEnabled(bool),
     SetLogging(bool),
     Rebind,
+    /// A periodic wake-up. Carries no data: its only job is to make the
+    /// applet's event loop turn over. See [`App::subscription`].
+    Tick,
     /// Switch to the engine at this index of the cycle. An index rather than
     /// a name because iced's radio wants a `Copy` value.
     SetEngine(usize),
@@ -136,7 +139,30 @@ impl cosmic::Application for App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(engine_stream)
+        // Engine events reach the applet over a broadcast channel written from
+        // the engine's own thread, and the wake that should carry across to
+        // this Wayland event loop does not: the message sits unprocessed until
+        // the loop turns over for some other reason — a pointer motion, the
+        // popup opening. Left alone the panel glyph is whatever it was at the
+        // last such event, which reads as "the mode indicator does not
+        // update". A low tick turns the loop over on its own, so a broadcast
+        // event waiting to be drained is picked up within one interval. Only
+        // while something can actually change without input: the multiplexer's
+        // mode and engine, and the transient engine states that advance on
+        // their own (models loading, a recording's clock, a decode finishing).
+        let self_moving = matches!(self.input_method, InputMethodState::Running { .. })
+            || matches!(
+                self.state,
+                EngineState::Starting | EngineState::Recording | EngineState::Transcribing
+            );
+        let events = Subscription::run(engine_stream);
+        if self_moving {
+            let tick = cosmic::iced::time::every(std::time::Duration::from_millis(200))
+                .map(|_| Message::Tick);
+            Subscription::batch([events, tick])
+        } else {
+            events
+        }
     }
 
     fn update(&mut self, message: Message) -> app::Task<Message> {
@@ -183,6 +209,9 @@ impl cosmic::Application for App {
                     let _ = handle.commands.try_send(Command::Rebind);
                 }
             }
+            // Nothing to do: waking the loop was the point, and returning here
+            // re-runs `view` with whatever state the pending events left.
+            Message::Tick => {}
             // Both close the popup, like a menu does on a pick — and not only
             // for the feel of it. A mode activation is held by the frontend
             // until a text field is active again (ibus detaches the engine
