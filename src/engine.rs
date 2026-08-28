@@ -291,6 +291,9 @@ impl Engine {
     fn create(config: Config, events: broadcast::Sender<Event>) -> Result<Self> {
         let capture = Capture::start(config.preroll_ms).context("starting audio capture")?;
         let (link, im_events) = start_input_method(&config);
+        if let Some(link) = link.as_ref() {
+            link.set_trigger(config.trigger_code);
+        }
         let sink = TextSink::connect(&config, link.clone())?;
         tracing::info!("text output ready: {}", sink.status());
         let asr = crate::asr::spawn(&config);
@@ -514,6 +517,9 @@ impl Engine {
         self.rebinding = false;
         if let Some(code) = code {
             self.config.trigger_code = code;
+            if let Some(link) = self.im_link.as_ref() {
+                link.set_trigger(code);
+            }
             if let Err(e) = Config::persist_trigger(code) {
                 tracing::warn!("could not save the trigger: {e:#}");
                 self.emit(Event::Failed { reason: format!("trigger not saved: {e:#}") });

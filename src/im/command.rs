@@ -21,7 +21,7 @@
 //! resolved by [`super::dictation::advance`] on the other side, which sees the
 //! current value.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use calloop::channel::Sender;
@@ -117,6 +117,15 @@ pub struct ImLink {
     commands: Arc<Mutex<Option<Sender<ImCmd>>>>,
     /// What the frontend says about itself.
     status  : Arc<ImStatus>,
+    /// The dictation trigger's evdev code, written by the engine and read by
+    /// the frontend on every key. `0` (`KEY_RESERVED`) means no trigger.
+    ///
+    /// A shared cell rather than a command because it has to survive a
+    /// frontend restart: the supervisor rebuilds the frontend from the same
+    /// options, and a value pushed over the channel would be gone with the
+    /// loop that received it. See [`ImLink::trigger`] for why the frontend
+    /// wants it at all.
+    trigger : Arc<AtomicU32>,
 }
 
 impl ImLink {
@@ -133,6 +142,29 @@ impl ImLink {
     /// Whether dictation should use the input-method path right now.
     pub fn is_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    /// Records the dictation trigger's evdev code. Called by the engine at
+    /// start and after every rebind.
+    pub fn set_trigger(&self, code: u16) {
+        self.trigger.store(u32::from(code), Ordering::Relaxed);
+    }
+
+    /// The dictation trigger's evdev code, if one is set.
+    ///
+    /// The hotkey watcher reads the trigger off evdev, but the compositor
+    /// delivers the same key to the focused keyboard — which, while a text
+    /// field is active, is the frontend's grab. Forwarded to the application
+    /// it is a key nobody asked for, held down for the whole utterance with
+    /// its repeats landing in the middle of the preedit; xterm.js, for one,
+    /// answers a keydown during a composition by committing the preedit
+    /// itself, which doubled the first dictated word. So the frontend swallows
+    /// it, and this is how it knows which key that is.
+    pub fn trigger(&self) -> Option<u32> {
+        match self.trigger.load(Ordering::Relaxed) {
+            0    => None,
+            code => Some(code),
+        }
     }
 
     /// Points the link at a freshly started frontend's channel.
@@ -190,6 +222,25 @@ mod tests {
         status.set_bound(false);
         status.set_bound(true);
         assert!(!status.is_active());
+    }
+
+    /// The trigger cell is what lets the frontend tell the dictation key from
+    /// every other key on the grab. Unset it must read as "no trigger", not
+    /// as `KEY_RESERVED`, or a frontend started before the engine wrote it
+    /// would swallow evdev code 0; and a rebind must replace it, because the
+    /// old key is an ordinary key again the moment the new one is chosen.
+    #[test]
+    fn trigger_is_unset_until_the_engine_writes_it() {
+        let link = ImLink::new();
+        assert_eq!(link.trigger(), None);
+
+        link.set_trigger(183);
+        assert_eq!(link.trigger(), Some(183));
+        // Clones share the cell: the engine's copy and the frontend's are the
+        // same link.
+        let frontend_side = link.clone();
+        link.set_trigger(87);
+        assert_eq!(frontend_side.trigger(), Some(87));
     }
 
     /// The harness writes these by hand, so the spelling is part of the

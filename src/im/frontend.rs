@@ -698,6 +698,18 @@ impl Frontend {
         // a press because it is a different key now.
         self.cancel_repeat();
 
+        // The dictation trigger is the engine's, not the application's: the
+        // hotkey watcher already has it off evdev, and forwarding it would
+        // hand the focused field a key held for the whole utterance, repeats
+        // and all, in the middle of the preedit. See [`ImLink::trigger`].
+        if self.commands.as_ref().and_then(ImLink::trigger) == Some(evdev) {
+            tracing::debug!(
+                "key {evdev} {}: the dictation trigger; swallowed",
+                if pressed { "press" } else { "release" },
+            );
+            return;
+        }
+
         self.deliver_key(time, evdev, pressed);
 
         if pressed {
