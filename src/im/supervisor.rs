@@ -37,6 +37,12 @@
 //! every user will see the first time they set `input_method: Multiplexer`,
 //! and it deserves a sentence in the popup telling them what to do rather than
 //! a stack of `Failed` events.
+//!
+//! It is also what a *reverted* cutover looks like, which is the harder case to
+//! word: the autostart entry is correct and a bridge is running anyway, because
+//! something else in `~/.config/autostart` started one. The generator there does
+//! not filter on the `.desktop` suffix, so a backup copy of the entry is an
+//! entry. Hence the second sentence in the reason.
 
 use std::time::{Duration, Instant};
 
@@ -125,7 +131,9 @@ fn run_supervised(supervised: Supervised) {
                     ImEvent::Blocked {
                         reason: format!(
                             "ibus-ui-gtk3 --enable-wayland-im is running (pid {pid}); \
-                             run scripts/cutover.sh and restart IBus",
+                             run scripts/cutover.sh and restart IBus. If you already \
+                             did, something is starting it again — every file in \
+                             ~/.config/autostart is autostarted, backups included",
                         ),
                     },
                 );

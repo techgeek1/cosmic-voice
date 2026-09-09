@@ -15,8 +15,13 @@
 
 set -euo pipefail
 
-AUTOSTART="$HOME/.config/autostart/ibus-wayland.desktop"
-BACKUP="$AUTOSTART.pre-multiplexer"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+AUTOSTART="$AUTOSTART_DIR/ibus-wayland.desktop"
+BACKUP="${XDG_STATE_HOME:-$HOME/.local/state}/cosmic-voice/ibus-wayland.desktop.pre-multiplexer"
+# Where revisions of this script up to 2026-08 left it: inside the autostart
+# directory, where the generator picks it up as an entry of its own. Restoring
+# from it is also what removes it, which is the point.
+LEGACY_BACKUP="$AUTOSTART.pre-multiplexer"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/cosmic-voice/config.ron"
 
 say() { printf '%s\n' "$*"; }
@@ -25,17 +30,23 @@ die() { printf 'rollback: %s\n' "$*" >&2; exit 1; }
 yes=false
 [ "${1:-}" = "--yes" ] && yes=true
 
-[ -f "$BACKUP" ] || die "no backup at $BACKUP.
+if [ -f "$BACKUP" ]; then
+    restore_from="$BACKUP"
+elif [ -f "$LEGACY_BACKUP" ]; then
+    restore_from="$LEGACY_BACKUP"
+else
+    die "no backup at $BACKUP.
 If you never ran cutover.sh, there is nothing to roll back: set
 \`input_method: Off\` in $CONFIG and restart the applet.
 Otherwise write the autostart entry back by hand:
     Exec=ibus start --type wayland"
+fi
 
 say ""
 say "=== cosmic-voice input-method rollback ==="
 say ""
 say "  now    : $(grep '^Exec=' "$AUTOSTART" 2>/dev/null || echo '(file missing)')"
-say "  backup : $(grep '^Exec=' "$BACKUP")"
+say "  backup : $(grep '^Exec=' "$restore_from")   ($restore_from)"
 say ""
 say "About to restore $AUTOSTART from the backup."
 say "Nothing running is touched."
@@ -50,7 +61,7 @@ if ! $yes; then
     esac
 fi
 
-mv "$BACKUP" "$AUTOSTART"
+mv "$restore_from" "$AUTOSTART"
 say ""
 say "Done: $(grep '^Exec=' "$AUTOSTART")"
 
