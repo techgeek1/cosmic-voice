@@ -169,6 +169,21 @@ impl ContentType {
             hints  : convert_hints(hints),
         }
     }
+
+    /// Whether the field holds a credential: a password or PIN purpose, or
+    /// text the client asked to have hidden.
+    ///
+    /// The frontend leaves such fields entirely alone — no keyboard grab, no
+    /// engine — so the keystrokes never pass through this process and the
+    /// application sees raw keys exactly as if no input method were bound.
+    /// That is what mozc does for itself on a password purpose, and it is
+    /// also the only routing a session lock can survive: cosmic-greeter, like
+    /// every libcosmic app built without `single-instance`, drops IME commits
+    /// on the floor.
+    pub fn secret(&self) -> bool {
+        matches!(self.purpose, IBUS_PURPOSE_PASSWORD | IBUS_PURPOSE_PIN)
+            || self.hints & IBUS_HINT_HIDDEN_TEXT != 0
+    }
 }
 
 /// Maps a text-input-v3 hint mask onto IBus's.
@@ -327,6 +342,18 @@ mod tests {
 
     /// The defaults `activate` resets to, which is what an engine sees for a
     /// client that never sends a content type at all.
+    #[test]
+    fn a_credential_field_is_secret() {
+        assert!(ContentType::from_wayland(0, PURPOSE_PASSWORD).secret());
+        assert!(ContentType::from_wayland(0, PURPOSE_PIN).secret());
+        assert!(ContentType::from_wayland(HINT_HIDDEN_TEXT, PURPOSE_NORMAL).secret());
+        // `sensitive_data` is "do not store", not "hide"; it does not make a
+        // field a credential on its own.
+        assert!(!ContentType::from_wayland(HINT_SENSITIVE_DATA, PURPOSE_NORMAL).secret());
+        assert!(!ContentType::from_wayland(0, PURPOSE_TERMINAL).secret());
+        assert!(!ContentType::default().secret());
+    }
+
     #[test]
     fn defaults_to_an_ordinary_field() {
         assert_eq!(

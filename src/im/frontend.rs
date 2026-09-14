@@ -566,6 +566,7 @@ impl Frontend {
         }
         self.surrounding = self.pending.surrounding.clone();
         self.change_cause = self.pending.change_cause;
+        let previous = self.content;
         let content_changed = self.content != self.pending.content;
         self.content = self.pending.content;
 
@@ -573,7 +574,25 @@ impl Frontend {
             (false, true) => self.activate(),
             (true, false) => self.deactivate(),
             (true, true)  => {
-                if content_changed {
+                // A field that turns into a credential (or stops being one)
+                // under us changes whether we may hold the keyboard at all.
+                if content_changed && previous.secret() != self.content.secret() {
+                    if self.content.secret() {
+                        tracing::info!("field became secret; releasing the keyboard");
+                        self.release_keyboard();
+                        if let Some(popup) = self.popup.as_mut() {
+                            popup.set_active(false);
+                        }
+                        self.with_context("FocusOut", |context| context.focus_out());
+                    } else {
+                        tracing::info!("field no longer secret; taking the keyboard");
+                        self.take_keyboard();
+                        if let Some(popup) = self.popup.as_mut() {
+                            popup.set_active(true);
+                        }
+                        self.attach_context();
+                    }
+                } else if content_changed {
                     self.push_content_type();
                 }
                 // The caret moved or the text changed under it. Only an engine
@@ -588,6 +607,13 @@ impl Frontend {
     }
 
     /// A text field took focus: take the keyboard and take IBus focus.
+    ///
+    /// Unless it is a credential field, in which case take nothing: no grab,
+    /// no virtual keyboard, no engine. The compositor then delivers keys to
+    /// the application directly, which is the only routing a password box
+    /// that cannot receive IME commits (the session lock, among others) can
+    /// survive, and it keeps the password out of this process altogether.
+    /// See [`ContentType::secret`].
     fn activate(&mut self) {
         tracing::info!("activate (serial {}) {}", self.serial, self.content);
 
@@ -596,6 +622,22 @@ impl Frontend {
         // grab may describe a layout the user has since changed away from.
         self.keyboard.forget();
 
+        if self.content.secret() {
+            tracing::info!("secret field; leaving the keyboard to the application");
+            return;
+        }
+
+        self.take_keyboard();
+        if let Some(popup) = self.popup.as_mut() {
+            popup.set_active(true);
+        }
+
+        self.attach_context();
+    }
+
+    /// Takes the seat-wide grab and creates the virtual keyboard that replays
+    /// through it. One activation's worth; [`Self::release_keyboard`] undoes it.
+    fn take_keyboard(&mut self) {
         let vkbd = self
             .vk_manager
             .create_virtual_keyboard(&self.seat, &self.qh, ());
@@ -605,11 +647,17 @@ impl Frontend {
             vkbd      : vkbd,
             has_keymap: false,
         });
-        if let Some(popup) = self.popup.as_mut() {
-            popup.set_active(true);
-        }
+    }
 
-        self.attach_context();
+    /// Releases the grab and destroys the virtual keyboard, if held. The grab
+    /// object's destructor is what gives the seat its keys back.
+    fn release_keyboard(&mut self) {
+        self.cancel_repeat();
+        if let Some(session) = self.session.take() {
+            session.grab.release();
+            session.vkbd.destroy();
+        }
+        self.keyboard.forget();
     }
 
     /// Focus went away: give the keyboard and IBus focus back.
@@ -636,11 +684,7 @@ impl Frontend {
         self.with_context("Reset", |context| context.reset());
         self.with_context("FocusOut", |context| context.focus_out());
 
-        if let Some(session) = self.session.take() {
-            session.grab.release();
-            session.vkbd.destroy();
-        }
-        self.keyboard.forget();
+        self.release_keyboard();
         self.preedit = None;
     }
 
@@ -681,7 +725,7 @@ impl Frontend {
     /// registration is global and the sooner it exists the sooner the trigger
     /// stops typing a space.
     fn on_tick(&mut self) {
-        if self.active && self.link.context().is_none() {
+        if self.active && !self.content.secret() && self.link.context().is_none() {
             self.attach_context();
         }
         self.switcher.ensure(&self.signals);
