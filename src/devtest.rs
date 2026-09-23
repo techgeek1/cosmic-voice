@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr::{Recognizer, SAMPLE_RATE, StreamingRecognizer};
 use crate::engine::TICK_MS;
-use crate::vad::SegmentGate;
+use crate::vad::{SegmentGate, SpeechDetector, window_ms};
 
 /// Dispatches one check by name.
 pub fn run(args: &[String]) -> Result<()> {
@@ -22,6 +22,7 @@ pub fn run(args: &[String]) -> Result<()> {
         [c, model, wav, n] if c == "stream" => stream(Path::new(model), wav, n.parse()?),
         [c, model, wav] if c == "finalize" => finalize(Path::new(model), wav, 4),
         [c, model, wav, n] if c == "finalize" => finalize(Path::new(model), wav, n.parse()?),
+        [c, wavs @ ..] if c == "vad" && !wavs.is_empty() => vad(wavs),
         [c, secs] if c == "capture"      => capture(secs.parse()?),
         [c] if c == "keys"               => keys(),
         [c] if c == "rebind"             => rebind(),
@@ -41,7 +42,7 @@ pub fn run(args: &[String]) -> Result<()> {
         [c, rest @ ..] if c == "im-frontend" => im_frontend(rest),
         _ => Err(anyhow!(
             "checks: decode <model_dir> <wav> [threads] | stream <model_dir> <wav> [threads] | \
-             finalize <model_dir> <wav> [threads] | capture <secs> | keys | rebind | \
+             finalize <model_dir> <wav> [threads] | vad <wav>… | capture <secs> | keys | rebind | \
              inject-probe | type <secs> <text> | ibus-info | ibus-keys <engine> <key>… | \
              im-frontend <wayland-display> [ibus-address] [--config <path>] \
              [--control-fifo <path>]"
@@ -102,6 +103,46 @@ fn stream(model: &Path, wav: &str, threads: u32) -> Result<()> {
     Ok(())
 }
 
+/// Runs each WAV through the speech detector in engine-tick windows.
+///
+/// Prints how much of the file counted as speech, which is what decides
+/// whether the engine would decode it as a tail, and the worst per-window
+/// cost, which is what the engine loop pays for running it inline.
+fn vad(wavs: &[String]) -> Result<()> {
+    let config = crate::config::Config::load();
+    let mut detector = SpeechDetector::load(&config.vad_model)?;
+    let window = (SAMPLE_RATE as u64 * TICK_MS / 1000) as usize;
+
+    for wav in wavs {
+        let samples = load_wav(wav)?;
+        detector.reset();
+
+        let mut voiced = 0;
+        let mut worst = Duration::ZERO;
+        let mut spent = Duration::ZERO;
+        let mut trace = String::new();
+        for w in samples.chunks(window) {
+            let t0 = Instant::now();
+            let speech = detector.push(w);
+            let dt = t0.elapsed();
+            worst = worst.max(dt);
+            spent += dt;
+            if speech {
+                voiced += window_ms(w);
+            }
+            trace.push(if speech { '#' } else { '.' });
+        }
+
+        let dur = samples.len() as f32 / SAMPLE_RATE as f32;
+        println!(
+            "{wav}\n  {dur:5.2}s  speech {voiced:5}ms  worst window {worst:>8.2?}  RTF {:.4}\n  {trace}",
+            spent.as_secs_f32() / dur,
+        );
+    }
+
+    Ok(())
+}
+
 /// Replays a WAV through the engine's segmentation and offline decode, timed.
 ///
 /// Answers the question the applet cannot be asked headlessly: how long the
@@ -121,6 +162,7 @@ fn finalize(model: &Path, wav: &str, threads: u32) -> Result<()> {
     let config = crate::config::Config::load();
 
     let rec = Recognizer::load(model, threads, config.hotword_score)?;
+    let mut detector = SpeechDetector::load(&config.vad_model)?;
     let mut gate = SegmentGate::new(config.segment_pause_ms, config.min_segment_ms);
     let window = (SAMPLE_RATE as u64 * TICK_MS / 1000) as usize;
 
@@ -137,16 +179,16 @@ fn finalize(model: &Path, wav: &str, threads: u32) -> Result<()> {
 
     for chunk in samples.chunks(window) {
         fed += chunk.len();
-        if !gate.push(chunk) {
-            continue;
-        }
+        let speech = detector.push(chunk);
+        let Some(cut) = gate.push(window_ms(chunk), speech) else { continue };
+        let end = (fed - cut.back_ms as usize * SAMPLE_RATE as usize / 1000).max(start);
 
         let t0 = Instant::now();
-        let text = rec.transcribe(&samples[start..fed], &config.default_hotwords)?;
+        let text = rec.transcribe(&samples[start..end], &config.default_hotwords)?;
         let dt = t0.elapsed();
         spent += dt;
 
-        let at = fed as f32 / SAMPLE_RATE as f32;
+        let at = end as f32 / SAMPLE_RATE as f32;
         println!(
             "segment  cut at {at:6.2}s  {:6.2}s audio  decode {dt:>8.2?}  slack {:+.2}s",
             at - prev_cut,
@@ -155,12 +197,19 @@ fn finalize(model: &Path, wav: &str, threads: u32) -> Result<()> {
         if !text.is_empty() {
             texts.push(text);
         }
-        start = fed;
+        start = end;
         prev_cut = at;
     }
 
+    // The engine skips a tail with no speech in it rather than let the model
+    // name the noise.
+    let heard = gate.voiced_ms();
     let t0 = Instant::now();
-    let text = rec.transcribe(&samples[start..], &config.default_hotwords)?;
+    let text = if heard > 0 {
+        rec.transcribe(&samples[start..], &config.default_hotwords)?
+    } else {
+        String::new()
+    };
     let tail = t0.elapsed();
     spent += tail;
     if !text.is_empty() {
@@ -168,7 +217,7 @@ fn finalize(model: &Path, wav: &str, threads: u32) -> Result<()> {
     }
 
     println!(
-        "tail     {:6.2}s audio  decode {tail:>8.2?}   <- latency after release",
+        "tail     {:6.2}s audio  speech {heard}ms  decode {tail:>8.2?}   <- latency after release",
         dur - prev_cut,
     );
     println!("total    {spent:.2?} of decode over {dur:.2}s audio in {} segments", texts.len());

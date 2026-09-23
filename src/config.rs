@@ -17,6 +17,9 @@ pub struct Config {
     pub model_path          : PathBuf,
     /// Streaming model producing provisional text. Also resident.
     pub streaming_model     : PathBuf,
+    /// Silero VAD model deciding what counts as speech: where utterances end,
+    /// where segments are cut, and whether a segment is worth decoding.
+    pub vad_model           : PathBuf,
     /// evdev key code to listen for. Defaults to `KEY_F13` (183).
     pub trigger_code        : u16,
     /// Hold the key to talk, versus press once to start and again to stop.
@@ -157,6 +160,7 @@ impl Default for Config {
         Self {
             model_path          : default_model_path(),
             streaming_model     : default_streaming_path(),
+            vad_model           : default_vad_path(),
             trigger_code        : 183,
             hold_to_talk        : true,
             preroll_ms          : 750,
@@ -330,6 +334,11 @@ fn default_model_path() -> PathBuf {
 /// Returns the default streaming model directory.
 fn default_streaming_path() -> PathBuf {
     data_dir().join("models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8")
+}
+
+/// Returns the default VAD model file.
+fn default_vad_path() -> PathBuf {
+    data_dir().join("models/silero_vad_v5.onnx")
 }
 
 /// Where committed transcripts are appended when logging is on.

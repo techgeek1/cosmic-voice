@@ -24,7 +24,7 @@ use crate::inject::common_prefix_len;
 use crate::ipc::{Command, Event, InputMethodState};
 use crate::sink::TextSink;
 use crate::transcript_log;
-use crate::vad::{SegmentGate, SilenceGate};
+use crate::vad::{SegmentGate, SilenceGate, SpeechDetector, window_ms};
 
 /// How often captured audio is drained to the recogniser while recording.
 pub const TICK_MS: u64 = 60;
@@ -244,6 +244,8 @@ struct Engine {
     /// The input-method thread's events, taken by [`Engine::run`] so the
     /// select loop can hold them without borrowing `self` twice.
     im_events  : Option<mpsc::UnboundedReceiver<ImEvent>>,
+    /// Speech verdicts both gates consume.
+    detector   : SpeechDetector,
     /// Trailing-silence detector for press-once mode.
     vad        : SilenceGate,
     /// Pause detector that cuts a long utterance into decodable segments.
@@ -270,6 +272,9 @@ struct Engine {
     seg_last   : bool,
     /// First segment error of this utterance, reported instead of a commit.
     seg_error  : Option<String>,
+    /// Whether any segment of this utterance carried speech. Without any, the
+    /// commit is empty whatever the streaming model guessed.
+    utt_heard  : bool,
     /// Wall-clock start of the current utterance.
     started    : Instant,
     /// Seconds value last published in a `Recording` event, to throttle them.
@@ -297,6 +302,7 @@ impl Engine {
         let sink = TextSink::connect(&config, link.clone())?;
         tracing::info!("text output ready: {}", sink.status());
         let asr = crate::asr::spawn(&config);
+        let detector = SpeechDetector::load(&config.vad_model).context("loading the VAD")?;
 
         let im_state = match config.input_method {
             InputMethod::Off         => InputMethodState::Off,
@@ -312,6 +318,7 @@ impl Engine {
         };
 
         Ok(Self {
+            detector   : detector,
             vad        : SilenceGate::new(config.silence_ms),
             seg_gate   : SegmentGate::new(config.segment_pause_ms, config.min_segment_ms),
             state      : State::Idle,
@@ -326,6 +333,7 @@ impl Engine {
             seg_wait   : 0,
             seg_last   : false,
             seg_error  : None,
+            utt_heard  : false,
             started    : Instant::now(),
             last_sec   : 0,
             hyps       : VecDeque::new(),
@@ -627,6 +635,7 @@ impl Engine {
         self.started = Instant::now();
         self.last_sec = 0;
         self.utt_len = 0;
+        self.detector.reset();
         self.vad.reset();
         self.seg_gate.reset();
         self.hyps.clear();
@@ -653,34 +662,18 @@ impl Engine {
         self.seg_wait = 0;
         self.seg_last = false;
         self.seg_error = None;
+        self.utt_heard = false;
     }
 
     /// Drains new audio to the streaming model and enforces the end rules.
     fn on_tick(&mut self) {
         let State::Recording { held } = self.state else { return };
 
-        let now = self.capture.now();
-        if now > self.cursor {
-            let chunk = self.capture.read(self.cursor, now);
-            self.cursor = now;
-
-            // Both gates see every window: the segment gate has to keep
-            // counting speech even on the windows the end gate ignores.
-            let boundary = self.seg_gate.push(&chunk);
-
-            // Silence only ends the utterance when no key is holding it open;
-            // in hold mode the human's finger is the endpointer.
-            if self.vad.push(&chunk) && !held {
-                self.finish_recording();
-                return;
-            }
-            let _ = self.asr.send(StreamCmd::Feed(chunk));
-
-            // The cut lands inside the pause the gate just measured, so no
-            // word is split and the tail left for release stays short.
-            if boundary {
-                self.cut_segment(self.cursor, false);
-            }
+        // Silence only ends the utterance when no key is holding it open; in
+        // hold mode the human's finger is the endpointer.
+        if self.listen() && !held {
+            self.finish_recording();
+            return;
         }
 
         let elapsed = self.started.elapsed();
@@ -695,12 +688,57 @@ impl Engine {
         }
     }
 
+    /// Judges the audio captured since the last call: feeds the streaming
+    /// model, runs both gates, and cuts any segment whose pause completed.
+    /// Returns true when the silence gate says the utterance is over.
+    fn listen(&mut self) -> bool {
+        let now = self.capture.now();
+        if now <= self.cursor {
+            return false;
+        }
+        let chunk = self.capture.read(self.cursor, now);
+        let mut pos = self.cursor;
+        self.cursor = now;
+
+        // Judged in tick-sized windows even when the chunk is longer, as the
+        // first one is by the whole pre-roll, so a cut lands in the window
+        // where its pause completed rather than wherever the chunk ended.
+        let window = (crate::audio::SAMPLE_RATE as u64 * TICK_MS / 1000) as usize;
+        for w in chunk.chunks(window) {
+            pos += w.len() as u64;
+            let ms = window_ms(w);
+            let speech = self.detector.push(w);
+
+            // Both gates see every window: the segment gate has to keep
+            // counting speech even on the windows the end gate ignores.
+            let cut = self.seg_gate.push(ms, speech);
+            if self.vad.push(ms, speech) {
+                return true;
+            }
+            // The cut lands inside the pause the gate just measured, so no
+            // word is split and the tail left for release stays short.
+            if let Some(cut) = cut {
+                let back = cut.back_ms as u64 * crate::audio::SAMPLE_RATE as u64 / 1000;
+                let at = pos.saturating_sub(back).max(self.seg_start);
+                self.cut_segment(at, false, cut.voiced_ms > 0);
+            }
+        }
+        let _ = self.asr.send(StreamCmd::Feed(chunk));
+
+        false
+    }
+
     /// Ends capture and hands the last segment to the offline model.
     ///
     /// Everything before the last pause is already decoded or decoding, so
     /// what the user waits on here is the tail, not the recording.
     fn finish_recording(&mut self) {
-        self.cut_segment(self.capture.now(), true);
+        // Audio since the last tick has not been judged yet, and a short last
+        // word lives exactly there. Whether it says the utterance is over is
+        // moot: it is ending either way.
+        let _ = self.listen();
+        let speech = self.seg_gate.voiced_ms() > 0;
+        self.cut_segment(self.cursor, true, speech);
 
         self.state = State::Transcribing;
         self.emit(Event::Transcribing);
@@ -708,15 +746,27 @@ impl Engine {
 
     /// Sends `seg_start..end` to the offline model as one segment.
     ///
+    /// A segment without `speech` goes out empty and so never reaches the
+    /// model. Decoded alone, the leftovers of a pause — room tone, a breath,
+    /// the key's click — come back as "Yeah." or "Mm."; sending the empty
+    /// segment anyway keeps it in the reply order, so reassembly and the
+    /// commit need no second path.
+    ///
     /// Hotwords go with every segment: biasing has to apply wherever the word
     /// happens to fall, and the context graph is rebuilt per stream anyway.
-    fn cut_segment(&mut self, end: u64, last: bool) {
-        let samples = self.capture.read(self.seg_start, end);
+    fn cut_segment(&mut self, end: u64, last: bool, speech: bool) {
+        let samples = if speech {
+            self.capture.read(self.seg_start, end)
+        } else {
+            Vec::new()
+        };
         let hotwords = self.config.default_hotwords.clone();
         self.seg_start = end;
         self.utt_len += samples.len();
         self.seg_wait += 1;
         self.seg_last = last;
+        self.utt_heard |= speech;
+        self.seg_gate.reset();
 
         let _ = self.offline.send(OfflineCmd::Transcribe {
             seq      : self.utt_seq,
@@ -800,6 +850,9 @@ impl Engine {
         // has already punctuated each one as a sentence would end.
         let text = self.seg_texts.join(" ");
         let text = match choose_final(&text, &self.last_hyp) {
+            // No speech anywhere: whatever the streaming model made of the
+            // noise is exactly what the skipped decodes were avoiding.
+            _ if !self.utt_heard    => String::new(),
             Final::Offline          => text,
             Final::Streamed(reason) => {
                 tracing::info!("committing the streamed text: {reason}");

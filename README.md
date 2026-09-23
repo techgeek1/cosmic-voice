@@ -20,9 +20,11 @@ machine.
   provisional and final text want opposite things.
   `nemotron-3.5-asr-streaming-0.6b` decodes incrementally at 560ms chunks to
   drive live preedit; offline passes of `parakeet-unified-en-0.6b` with hotword
-  biasing produce the text that actually gets committed. Transducers also emit
-  nothing during silence, which matters because push-to-talk brackets every
-  utterance with silence and whisper hallucinates there. The offline model is
+  biasing produce the text that actually gets committed. Transducers are far
+  less prone than whisper to inventing text in silence, but not immune: a clip
+  holding only room tone, a breath or a key click decodes to "Yeah.", "Mm." or
+  "Okay." almost every time. So a Silero VAD decides what counts as speech,
+  and audio without any never reaches the offline model. The offline model is
   English-only; the streaming one is multilingual and writes Japanese. So
   when the offline pass returns nothing, or returns no CJK for speech the
   streaming model wrote in CJK, the streaming hypothesis — the text you were
@@ -36,9 +38,11 @@ machine.
   Instead the engine cuts the recording at pauses of `segment_pause_ms` and
   decodes each finished segment while the next one is still being spoken, so
   releasing the key only ever decodes the tail. Measured on 60s of dictation:
-  3.9s of waiting before, 0.35s after. Cuts land inside silence, so no word is
-  split, and utterances too short to reach `min_segment_ms` of speech take the
-  single-pass path exactly as before. The two recognisers run on threads of
+  3.9s of waiting before, 0.35s after. Cuts land in the middle of the pause,
+  so no word is split, and utterances too short to reach `min_segment_ms` of
+  speech take the single-pass path exactly as before. A tail with no speech
+  in it, the usual case when you stop talking before letting go of the key,
+  is not decoded at all. The two recognisers run on threads of
   their own, so a segment decode never stalls the partials.
 - **Injection** is a synthesised keymap over `zwp_virtual_keyboard_v1`: it
   reaches every client, types arbitrary Unicode, and never contends with a real
@@ -182,7 +186,7 @@ microphone and no panel in the loop.
 ## Setup
 
 Map a key to F13 on your keyboard (e.g. via VIA/Keychron Launcher) or rebind
-the trigger from the popup once it is running, fetch both models with `just models` (~1.3GB into `~/.local/share/cosmic-voice`), then
+the trigger from the popup once it is running, fetch the models with `just models` (~1.3GB into `~/.local/share/cosmic-voice`), then
 `sudo just install` and add **Voice** to the panel through COSMIC's applet
 settings. No XKB changes are needed: evdev sits below the keymap, so it does
 not matter that the default `us` layout maps keycode 183 to `XF86Tools`.
@@ -319,7 +323,7 @@ rest mirror it, so every panel icon works and nothing runs multiplied.
 | -------------- | ------------------------------------------------- |
 | `hotkey.rs`    | evdev watcher, `EVIOCSMASK` filter, udev hotplug  |
 | `audio.rs`     | continuous capture, pre-roll ring buffer          |
-| `vad.rs`       | trailing-silence detection, segment cut points    |
+| `vad.rs`       | Silero speech detection, utterance end, segment cuts |
 | `asr.rs`       | streaming + offline recognisers, hotword biasing  |
 | `inject.rs`    | virtual-keyboard injection, and the retired IM path |
 | `sink.rs`      | which of the two paths dictated text takes        |

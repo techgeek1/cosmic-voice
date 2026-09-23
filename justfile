@@ -23,11 +23,12 @@ online   := "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11"
 offline_dir := "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8"
 online_dir  := "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8"
 
-# Fetch both resident ASR models into the user data dir, under the names the
-# default config expects.
+# Fetch both resident ASR models and the VAD into the user data dir, under the
+# names the default config expects.
 models:
     mkdir -p ~/.local/share/cosmic-voice/models
     cd ~/.local/share/cosmic-voice/models && \
+        curl -LO {{base}}/silero_vad_v5.onnx && \
         for m in {{offline}} {{online}}; do \
             curl -LO {{base}}/$m.tar.bz2 && tar xf $m.tar.bz2 && rm $m.tar.bz2; \
         done && \
