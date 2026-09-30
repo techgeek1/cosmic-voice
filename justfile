@@ -6,14 +6,20 @@ build:
     cargo build --release
 
 install: build
-    install -Dm0755 target/release/{{name}} {{prefix}}/bin/{{name}}
-    install -Dm0644 data/{{app_id}}.desktop {{prefix}}/share/applications/{{app_id}}.desktop
-    install -Dm0644 data/icons/hicolor/scalable/apps/cosmic-voice.svg {{prefix}}/share/icons/hicolor/scalable/apps/{{app_id}}.svg
+    sudo install -Dm0755 target/release/{{name}} {{prefix}}/bin/{{name}}
+    sudo install -Dm0644 data/{{app_id}}.desktop {{prefix}}/share/applications/{{app_id}}.desktop
+    sudo install -Dm0644 data/icons/hicolor/scalable/apps/cosmic-voice.svg {{prefix}}/share/icons/hicolor/scalable/apps/{{app_id}}.svg
+    sudo install -Dm0644 data/70-cosmic-voice.rules {{prefix}}/lib/udev/rules.d/70-cosmic-voice.rules
+    sudo udevadm control --reload
+    sudo udevadm trigger --action=change --subsystem-match=input
 
 uninstall:
-    rm -f {{prefix}}/bin/{{name}}
-    rm -f {{prefix}}/share/applications/{{app_id}}.desktop
-    rm -f {{prefix}}/share/icons/hicolor/scalable/apps/{{app_id}}.svg
+    sudo rm -f {{prefix}}/bin/{{name}}
+    sudo rm -f {{prefix}}/share/applications/{{app_id}}.desktop
+    sudo rm -f {{prefix}}/share/icons/hicolor/scalable/apps/{{app_id}}.svg
+    sudo rm -f {{prefix}}/lib/udev/rules.d/70-cosmic-voice.rules
+    sudo udevadm control --reload
+    sudo udevadm trigger --action=change --subsystem-match=input
 
 base     := "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
 offline  := "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"

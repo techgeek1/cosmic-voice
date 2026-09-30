@@ -1,0 +1,14 @@
+# Lets the active session read the keyboards cosmic-voice takes its trigger
+# from. systemd's stock rules put the logind `uaccess` ACL on joysticks only,
+# so without this an ordinary keyboard is root:input 0660 and the watcher sees
+# nothing.
+#
+# Keep this to the boards that carry the trigger. A uaccess tag lets every
+# process in the session read every key on that device, which is the thing the
+# EVIOCSMASK filter in hotkey.rs exists to avoid. Add a line per keyboard,
+# matched on the attributes `udevadm info -a /dev/input/eventN` prints.
+#
+# Must sort before 73-seat-late.rules, which applies the tag.
+
+# ASUS ROG Zephyrus G15 (GA503) internal keyboard: the M1-M4 keys live here.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="0b05", ATTRS{id/product}=="19b6", TAG+="uaccess"

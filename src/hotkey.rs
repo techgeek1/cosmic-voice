@@ -21,8 +21,11 @@
 //! [`CAPTURE_WINDOW`], after which the narrow mask goes back on. See
 //! [`Watcher::run_blocking`].
 //!
-//! No elevated access is required. logind tags input devices `uaccess` and puts
-//! an ACL for the active session's user on them.
+//! No elevated access is required, but the device has to be readable by the
+//! session. logind puts an ACL for the active session's user on nodes tagged
+//! `uaccess`, and systemd's stock rules tag only joysticks, so an ordinary
+//! keyboard needs `data/70-cosmic-voice.rules` or an equivalent rule. Without
+//! one the watcher sees nothing, and says so once per rebuild.
 
 use anyhow::{Context, Result};
 use rustix::event::{PollFd, PollFlags};
@@ -208,7 +211,8 @@ impl Watcher {
         'rebuild: loop {
             let capturing = matches!(self.mode, Mode::Capturing { .. });
             let mut devices: Vec<OwnedFd> = Vec::new();
-            for path in self.discover(capturing)? {
+            let (paths, denied) = self.discover(capturing)?;
+            for path in paths {
                 let opened = if capturing {
                     open_unmasked(&path)
                 } else {
@@ -226,7 +230,19 @@ impl Watcher {
                 }
             }
             if devices.is_empty() {
-                tracing::warn!("no accessible device advertises the trigger; waiting for hotplug");
+                if denied.is_empty() {
+                    tracing::warn!("no device advertises the trigger; waiting for hotplug");
+                } else {
+                    let names: Vec<String> =
+                        denied.iter().map(|p| p.display().to_string()).collect();
+                    tracing::warn!(
+                        "no readable device advertises the trigger, and {} input devices are \
+                         not readable by this session ({}); install data/70-cosmic-voice.rules \
+                         or add a uaccess rule for the keyboard",
+                        denied.len(),
+                        names.join(", "),
+                    );
+                }
             }
 
             loop {
@@ -339,12 +355,14 @@ impl Watcher {
 
 impl Watcher {
     /// Finds every `/dev/input/event*` whose key bitmap advertises the trigger,
-    /// or, when `any_key`, any key at all.
+    /// or, when `any_key`, any key at all. Also returns the nodes that could
+    /// not be opened for lack of permission, whose capabilities are unknown.
     ///
     /// QMK boards expose several HID interfaces and the trigger may arrive on
     /// any of them, so this matches on capability rather than on device name.
-    fn discover(&self, any_key: bool) -> Result<Vec<PathBuf>> {
-        let mut found = Vec::new();
+    fn discover(&self, any_key: bool) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let mut found  = Vec::new();
+        let mut denied = Vec::new();
         for entry in std::fs::read_dir("/dev/input").context("listing /dev/input")? {
             let path = entry.context("reading /dev/input")?.path();
             let is_event = path
@@ -354,7 +372,15 @@ impl Watcher {
             if !is_event {
                 continue;
             }
-            let Some(bits) = key_capabilities(&path) else { continue };
+            let bits = match key_capabilities(&path) {
+                Ok(Some(bits))      => bits,
+                Ok(None)            => continue,
+                Err(Errno::ACCESS)  => {
+                    denied.push(path);
+                    continue;
+                }
+                Err(_)              => continue,
+            };
             let wanted = if any_key {
                 // Only the KEY_ range counts; a mouse advertising BTN_ codes
                 // alone is not a keyboard.
@@ -367,26 +393,28 @@ impl Watcher {
             }
         }
         found.sort();
+        denied.sort();
 
-        Ok(found)
+        Ok((found, denied))
     }
 }
 
 /// Reads the key-capability bitmap of the device at `path`.
 ///
-/// Returns `None` for devices we cannot open; those are also devices we could
-/// never read, so they are simply not candidates.
-fn key_capabilities(path: &Path) -> Option<[u8; KEY_BITMAP_LEN]> {
+/// Fails with the open error for devices we cannot open, so the caller can
+/// tell a permission problem from a device that is simply gone. Returns
+/// `None` for nodes that are not evdev devices.
+fn key_capabilities(path: &Path) -> std::result::Result<Option<[u8; KEY_BITMAP_LEN]>, Errno> {
     use rustix::fs::{Mode, OFlags, open};
 
-    let fd = open(path, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()).ok()?;
+    let fd = open(path, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())?;
 
     let mut bits = [0u8; KEY_BITMAP_LEN];
     // SAFETY: `bits` lives across the call and is exactly the length the ioctl
     // number encodes; the descriptor is a live evdev node.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), EVIOCGBIT_KEY, bits.as_mut_ptr()) };
 
-    (rc >= 0).then_some(bits)
+    Ok((rc >= 0).then_some(bits))
 }
 
 /// Reads and parses whatever complete events are currently available.

@@ -11,7 +11,8 @@ machine.
   implement GlobalShortcuts, so neither can report a release. `EVIOCSMASK`
   restricts the descriptor to the trigger keycode and suppresses `MSC_SCAN`, so
   no other keystroke is ever delivered to this process. No root, no `input`
-  group: logind's `uaccess` ACL is enough.
+  group: logind's `uaccess` ACL is enough, but systemd only tags joysticks
+  with it, so the keyboard carrying the trigger needs a rule (see Setup).
 - **Capture** runs continuously into a ring buffer, so the ~750ms before the key
   registers is still there and the first syllable survives. It is a native
   PipeWire client so the callback rides the RT data-loop and keeps being
@@ -190,6 +191,19 @@ the trigger from the popup once it is running, fetch the models with `just model
 `sudo just install` and add **Voice** to the panel through COSMIC's applet
 settings. No XKB changes are needed: evdev sits below the keymap, so it does
 not matter that the default `us` layout maps keycode 183 to `XF86Tools`.
+
+The session has to be able to read that keyboard's evdev node. systemd's stock
+`70-uaccess.rules` gives the session an ACL on joysticks only, so a plain
+keyboard stays `root:input 0660` and the trigger (and a rebind) sees nothing;
+the log then warns that input devices are not readable by this session.
+`just install` installs `data/70-cosmic-voice.rules` into
+`/usr/lib/udev/rules.d` and re-triggers the input devices. It covers the
+Zephyrus G15's internal keyboard; for another board, add a line matching its
+`ATTRS{id/vendor}` and `ATTRS{id/product}` from `udevadm info -a
+/dev/input/eventN`. Keep the rule to the board that carries the trigger: the
+tag lets anything in the session read every key on it. Some QMK boards expose
+an interface udev classes as a joystick and so get the ACL anyway, which is
+why this can work on one machine without a rule.
 
 Settings live in `~/.config/cosmic-voice/config.ron`, written with commented
 defaults on first run. `asr_threads` (2) sizes the streaming recogniser and
